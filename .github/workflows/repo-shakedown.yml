@@ -112,9 +112,6 @@ jobs:
           curl -sSL https://strix.ai/install | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Pull Strix sandbox image
-        run: docker pull ghcr.io/usestrix/strix-sandbox:latest
-
       - name: Configure git credentials for private repos
         env:
           CLONE_TOKEN: ${{ secrets.REPO_CLONE_PAT || github.token }}
