@@ -1,31 +1,13 @@
-name: Security Scan
-
-# Copy this file into your org's repo .github/workflows/ directory.
-#
-# Required secrets:
-#   AWS_ACCESS_KEY_ID        — AWS credentials with S3 read/write
-#   AWS_SECRET_ACCESS_KEY
-#   S3_BUCKET                — bucket that holds pit-boss snapshots and reports
-#   GEMINI_API_KEY           — (or OPENAI_API_KEY / ANTHROPIC_API_KEY / LLM_API_KEY)
-#
-# Optional secrets:
-#   REPO_CLONE_PAT           — GitHub PAT for scanning private repos
-#   SLACK_WEBHOOK_URL        — incoming webhook for Slack notifications
-#   JIRA_BASE_URL            — https://your-org.atlassian.net
-#   JIRA_EMAIL               — Jira user email
-#   JIRA_API_TOKEN           — Jira API token
-#   AWS_REGION               — defaults to us-east-1
+name: Repo Shakedown
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours — cycles through all recommendations
-
+    - cron: "0 */6 * * *"  # Every 6 hours — cycles through pit-boss recommendations
   workflow_dispatch:
     inputs:
       pitboss_s3_prefix:
         description: 'S3 prefix for pit-boss data (leave blank for auto-detect)'
         required: false
-        type: string
         default: ''
       enable_jira:
         description: 'Create Jira tickets'
@@ -42,7 +24,16 @@ jobs:
   shakedown:
     uses: BeyondMachines/repo-shakedown/.github/workflows/repo-shakedown.yml@v1
     with:
+      s3_bucket: "pr-bouncer-code-reviews"
       pitboss_s3_prefix: ${{ inputs.pitboss_s3_prefix || '' }}
-      enable_jira: ${{ inputs.enable_jira || true }}
-      enable_slack: ${{ inputs.enable_slack || true }}
-    secrets: inherit
+      enable_jira: ${{ fromJSON(inputs.enable_jira || 'true') }}
+      enable_slack: ${{ fromJSON(inputs.enable_slack || 'true') }}
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.PR_BOUNCER_GEMINI_API_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.PR_BOUNCER_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.PR_BOUNCER_AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.PR_BOUNCER_VATBOX_AWS_REGION }}
+      SLACK_WEBHOOK_URL: ${{ secrets.PR_BOUNCER_SLACK_WEBHOOK_URL }}
+      JIRA_BASE_URL: ${{ secrets.PR_BOUNCER_JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.PR_BOUNCER_JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.PR_BOUNCER_JIRA_API_TOKEN }}

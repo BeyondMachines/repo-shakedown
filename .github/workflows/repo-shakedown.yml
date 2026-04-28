@@ -5,9 +5,13 @@ name: Repo Shakedown
 #     shakedown:
 #       uses: BeyondMachines/repo-shakedown/.github/workflows/repo-shakedown.yml@v1
 #       with:
+#         s3_bucket: "your-bucket-name"
 #         enable_jira: true
 #         enable_slack: true
-#       secrets: inherit
+#       secrets:
+#         GEMINI_API_KEY: ${{ secrets.YOUR_GEMINI_KEY }}
+#         AWS_ACCESS_KEY_ID: ${{ secrets.YOUR_AWS_KEY_ID }}
+#         AWS_SECRET_ACCESS_KEY: ${{ secrets.YOUR_AWS_SECRET }}
 
 on:
   workflow_call:
@@ -47,6 +51,10 @@ on:
         required: false
         type: boolean
         default: false
+      s3_bucket:
+        description: 'S3 bucket for pit-boss snapshots, reports, and scan tracking'
+        required: true
+        type: string
       scripts_ref:
         description: 'Git ref to use when checking out repo-shakedown scripts (default: v1)'
         required: false
@@ -67,8 +75,6 @@ on:
         required: false
       AWS_REGION:
         required: false
-      S3_BUCKET:
-        required: true
       SLACK_WEBHOOK_URL:
         required: false
       JIRA_BASE_URL:
@@ -126,7 +132,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_BUCKET: ${{ inputs.s3_bucket }}
           S3_REPORTS_PREFIX: ${{ inputs.s3_reports_prefix }}
           SLACK_WEBHOOK_URL: ${{ inputs.enable_slack && secrets.SLACK_WEBHOOK_URL || '' }}
           JIRA_BASE_URL: ${{ inputs.enable_jira && secrets.JIRA_BASE_URL || '' }}
