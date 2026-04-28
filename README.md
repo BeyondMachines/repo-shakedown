@@ -9,7 +9,7 @@ Orchestrates [Strix](https://github.com/usestrix/strix) penetration testing usin
 | [pr-bouncer](https://github.com/BeyondMachines/pr-bouncer) | Checks every PR at the door |
 | [pit-boss](https://github.com/BeyondMachines/pit-boss) | Reviews the floor, flags trouble |
 | **repo-shakedown** | Takes flagged repos to the back room — Strix-powered pentesting |
-
+ 
 ---
 
 ## How It Works
