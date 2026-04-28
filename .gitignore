@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+
+# Strix scan results (don't commit reports to git)
+strix_runs/
+agent_runs/
+*.tar.gz
+
+# Strix config (contains API keys)
+.strix/
+
+# Runtime / ephemeral working state
+shakedown-work/
+repos/
+__pycache__/
+*.pyc
+
+# Root-level test/demo JSON fixtures
+*.json
+
+# Local AI tool config and docs
+.claude/
+GEMINI.md
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db

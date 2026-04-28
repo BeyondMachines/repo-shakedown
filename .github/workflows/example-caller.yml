@@ -1,0 +1,79 @@
+name: Security Scan (example caller)
+
+# Example workflow for organisations that want to use repo-shakedown
+# as a reusable action.  Copy this file into your own repo's
+# .github/workflows/ directory and populate the required secrets.
+#
+# Required secrets in the calling repo:
+#   AWS_ACCESS_KEY_ID        — AWS credentials with S3 read/write
+#   AWS_SECRET_ACCESS_KEY
+#   S3_BUCKET                — bucket that holds pit-boss snapshots and reports
+#   GEMINI_API_KEY           — (or OPENAI_API_KEY / ANTHROPIC_API_KEY / LLM_API_KEY)
+#
+# Optional secrets:
+#   REPO_CLONE_PAT           — GitHub PAT for scanning private repos
+#   SLACK_WEBHOOK_URL        — incoming webhook for Slack notifications
+#   JIRA_BASE_URL            — https://your-org.atlassian.net
+#   JIRA_EMAIL               — Jira user email
+#   JIRA_API_TOKEN           — Jira API token
+#   JIRA_PROJECT_KEY         — defaults to SEC
+#   S3_REPORTS_PREFIX        — defaults to shakedown-reports/
+#   AWS_REGION               — defaults to us-east-1
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours — cycles through all recommendations
+
+  workflow_dispatch:
+    inputs:
+      pitboss_s3_prefix:
+        description: 'S3 prefix for pit-boss data (leave blank for auto-detect)'
+        required: false
+        type: string
+        default: ''
+      enable_jira:
+        description: 'Create Jira tickets'
+        required: false
+        type: boolean
+        default: true
+      enable_slack:
+        description: 'Send Slack notifications'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Run Repo Shakedown
+        uses: beyondmachines/repo-shakedown@v1
+        with:
+          pitboss_s3_prefix: ${{ inputs.pitboss_s3_prefix }}
+
+          # LLM — set whichever secret you have
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          llm_api_key: ${{ secrets.LLM_API_KEY }}
+
+          # AWS / S3
+          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+          s3_bucket: ${{ secrets.S3_BUCKET }}
+          s3_reports_prefix: ${{ secrets.S3_REPORTS_PREFIX || 'shakedown-reports/' }}
+
+          # Notifications
+          enable_slack: ${{ inputs.enable_slack || 'true' }}
+          slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+          enable_jira: ${{ inputs.enable_jira || 'true' }}
+          jira_base_url: ${{ secrets.JIRA_BASE_URL }}
+          jira_project_key: ${{ secrets.JIRA_PROJECT_KEY || 'SEC' }}
+          jira_email: ${{ secrets.JIRA_EMAIL }}
+          jira_api_token: ${{ secrets.JIRA_API_TOKEN }}
+
+          repo_clone_pat: ${{ secrets.REPO_CLONE_PAT }}

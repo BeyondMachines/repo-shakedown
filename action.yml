@@ -1,0 +1,195 @@
+name: 'Repo Shakedown'
+description: >
+  Scan one repo recommended by pit-boss, skip repos already scanned this month,
+  and post results as a Jira ticket and/or Slack notification.
+
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  # ── Pit-boss source ─────────────────────────────────────────────
+  pitboss_s3_prefix:
+    description: >
+      S3 prefix containing pit-boss candidates.json files
+      (e.g. shakedown/2026-04-d01-07/).
+      When omitted, auto-detects the current month folder:
+      pitboss-snapshots/YYYY-MM/.
+    required: false
+  pitboss_json:
+    description: 'Local path to candidates.json (alternative to S3 — for testing)'
+    required: false
+  repos_dir:
+    description: 'Working directory for cloned target repositories'
+    required: false
+    default: './repos'
+  auto_clone:
+    description: 'Clone missing repos automatically via git clone'
+    required: false
+    default: 'true'
+  reprocess:
+    description: 'Re-add repos even if their pit-boss snapshot was already ingested'
+    required: false
+    default: 'false'
+
+  # ── LLM ─────────────────────────────────────────────────────────
+  llm:
+    description: >
+      LLM model for Strix scanning and report summarisation
+      (e.g. gemini/gemini-2.5-pro, openai/gpt-4o, anthropic/claude-sonnet-4-6).
+    required: false
+    default: 'gemini/gemini-2.5-pro'
+  gemini_api_key:
+    required: false
+  openai_api_key:
+    required: false
+  anthropic_api_key:
+    required: false
+  llm_api_key:
+    description: 'Generic LLM API key (used when provider-specific key is absent)'
+    required: false
+
+  # ── AWS / S3 ─────────────────────────────────────────────────────
+  aws_access_key_id:
+    required: false
+  aws_secret_access_key:
+    required: false
+  aws_region:
+    required: false
+    default: 'us-east-1'
+  s3_bucket:
+    description: >
+      S3 bucket for pit-boss data downloads, report uploads, and monthly scan
+      tracking (scanned_repos.json).  Required for full pipeline; omit only for
+      local/pitboss-json runs.
+    required: false
+  s3_reports_prefix:
+    description: >
+      S3 key prefix for uploaded reports and the monthly tracking file
+      (e.g. shakedown-reports/).
+    required: false
+    default: 'shakedown-reports/'
+
+  # ── Slack notification ───────────────────────────────────────────
+  enable_slack:
+    description: 'Send Slack notification when a scan completes'
+    required: false
+    default: 'false'
+  slack_webhook_url:
+    description: 'Slack incoming webhook URL (required when enable_slack is true)'
+    required: false
+
+  # ── Jira ticket creation ─────────────────────────────────────────
+  enable_jira:
+    description: 'Create a Jira ticket for each completed scan'
+    required: false
+    default: 'false'
+  jira_base_url:
+    description: 'Jira instance URL, e.g. https://your-org.atlassian.net'
+    required: false
+  jira_project_key:
+    description: 'Jira project key for new tickets (default: SEC)'
+    required: false
+    default: 'SEC'
+  jira_email:
+    description: 'Jira user email for Basic auth'
+    required: false
+  jira_api_token:
+    description: 'Jira API token for Basic auth'
+    required: false
+
+  # ── Repo cloning credentials ─────────────────────────────────────
+  repo_clone_pat:
+    description: 'GitHub PAT for cloning private target repos (optional)'
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Python dependencies
+      shell: bash
+      run: pip install -r "${{ github.action_path }}/requirements.txt"
+
+    - name: Install Strix
+      shell: bash
+      run: |
+        curl -sSL https://strix.ai/install | bash
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Pull Strix sandbox image
+      shell: bash
+      run: docker pull ghcr.io/usestrix/strix-sandbox:latest
+
+    - name: Configure AWS credentials
+      if: ${{ inputs.aws_access_key_id != '' }}
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ inputs.aws_access_key_id }}
+        aws-secret-access-key: ${{ inputs.aws_secret_access_key }}
+        aws-region: ${{ inputs.aws_region }}
+
+    - name: Configure git credentials for private repos
+      if: ${{ inputs.repo_clone_pat != '' }}
+      shell: bash
+      run: |
+        git config --global \
+          url."https://x-access-token:${{ inputs.repo_clone_pat }}@github.com/".insteadOf \
+          "https://github.com/"
+
+    - name: Run Shakedown — scan one repo
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        LLM_API_KEY: ${{ inputs.llm_api_key }}
+        S3_BUCKET: ${{ inputs.s3_bucket }}
+        S3_REPORTS_PREFIX: ${{ inputs.s3_reports_prefix }}
+        SLACK_WEBHOOK_URL: ${{ inputs.enable_slack == 'true' && inputs.slack_webhook_url || '' }}
+        JIRA_BASE_URL: ${{ inputs.enable_jira == 'true' && inputs.jira_base_url || '' }}
+        JIRA_PROJECT_KEY: ${{ inputs.jira_project_key }}
+        JIRA_EMAIL: ${{ inputs.enable_jira == 'true' && inputs.jira_email || '' }}
+        JIRA_API_TOKEN: ${{ inputs.enable_jira == 'true' && inputs.jira_api_token || '' }}
+      run: |
+        # Resolve pit-boss source flag
+        if [ -n "${{ inputs.pitboss_s3_prefix }}" ]; then
+          SOURCE="--s3-prefix ${{ inputs.pitboss_s3_prefix }}"
+        elif [ -n "${{ inputs.pitboss_json }}" ]; then
+          SOURCE="--pitboss-json ${{ inputs.pitboss_json }}"
+        else
+          # Auto-detect current month's pit-boss folder
+          YEAR=$(date +%Y)
+          MONTH=$(date +%m)
+          SOURCE="--s3-prefix pitboss-snapshots/${YEAR}-${MONTH}/"
+        fi
+
+        REPROCESS_FLAG=""
+        [ "${{ inputs.reprocess }}" = "true" ] && REPROCESS_FLAG="--reprocess"
+
+        CLONE_FLAG=""
+        [ "${{ inputs.auto_clone }}" = "true" ] && CLONE_FLAG="--auto-clone"
+
+        python "${{ github.action_path }}/repo_shakedown.py" \
+          --llm "${{ inputs.llm }}" \
+          run-one \
+          $SOURCE \
+          --repos-dir "${{ inputs.repos_dir }}" \
+          $CLONE_FLAG \
+          $REPROCESS_FLAG
+
+    - name: Upload scan results as artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: shakedown-results-${{ github.run_id }}
+        path: |
+          ./shakedown-work/reports/
+          ./shakedown-work/results/
+          ./shakedown-work/tasks.json
+        retention-days: 90
+        if-no-files-found: ignore
