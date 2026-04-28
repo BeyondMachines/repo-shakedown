@@ -111,13 +111,11 @@ jobs:
 
       - name: Configure git credentials for private repos
         env:
-          REPO_CLONE_PAT: ${{ secrets.REPO_CLONE_PAT }}
+          CLONE_TOKEN: ${{ secrets.REPO_CLONE_PAT || github.token }}
         run: |
-          if [ -n "$REPO_CLONE_PAT" ]; then
-            git config --global \
-              url."https://x-access-token:${REPO_CLONE_PAT}@github.com/".insteadOf \
-              "https://github.com/"
-          fi
+          git config --global \
+            url."https://x-access-token:${CLONE_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
       - name: Run Shakedown — scan one repo
         env:
