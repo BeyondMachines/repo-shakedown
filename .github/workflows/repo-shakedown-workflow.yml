@@ -1,0 +1,53 @@
+name: Repo Shakedown (self-test)
+
+# Internal workflow — tests the reusable workflow against the current branch.
+# Scans one pit-boss-recommended repo per run.
+# Repos already scanned this calendar month are skipped automatically
+# (state tracked in S3 at S3_REPORTS_PREFIX/scanned_repos.json).
+#
+# Schedule: every 6 hours so the action cycles through all recommendations
+# over the course of a week without ever scanning the same repo twice a month.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+
+  workflow_dispatch:
+    inputs:
+      pitboss_s3_prefix:
+        description: 'S3 prefix for pit-boss data (leave blank to auto-detect current month)'
+        required: false
+        type: string
+        default: ''
+      llm:
+        description: 'LLM model override (e.g. gemini/gemini-2.5-pro, anthropic/claude-sonnet-4-6)'
+        required: false
+        type: string
+        default: 'gemini/gemini-2.5-pro'
+      enable_jira:
+        description: 'Create Jira tickets for findings'
+        required: false
+        type: boolean
+        default: false
+      enable_slack:
+        description: 'Send Slack notifications'
+        required: false
+        type: boolean
+        default: false
+      reprocess:
+        description: 'Re-ingest pit-boss snapshots even if already processed'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  shakedown:
+    uses: ./.github/workflows/repo-shakedown.yml
+    with:
+      pitboss_s3_prefix: ${{ inputs.pitboss_s3_prefix || '' }}
+      llm: ${{ inputs.llm || 'gemini/gemini-2.5-pro' }}
+      enable_slack: ${{ inputs.enable_slack || false }}
+      enable_jira: ${{ inputs.enable_jira || false }}
+      reprocess: ${{ inputs.reprocess || false }}
+      scripts_ref: ${{ github.sha }}
+    secrets: inherit

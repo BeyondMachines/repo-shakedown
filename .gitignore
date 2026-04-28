@@ -1,6 +1,6 @@
 # Secrets
 .env
-.env.*
+.env.beyondmachines
 
 # Strix scan results (don't commit reports to git)
 strix_runs/
