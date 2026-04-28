@@ -22,9 +22,10 @@ on:
 
 jobs:
   shakedown:
-    uses: BeyondMachines/repo-shakedown/.github/workflows/repo-shakedown.yml@v1
+    uses: BeyondMachines/repo-shakedown/.github/workflows/repo-shakedown.yml@c6eef9ced6585ca54af83f7902bf9b3933d3bc42  # v1
     with:
       s3_bucket: "pr-bouncer-code-reviews"
+      shakedown_threshold: 5
       pitboss_s3_prefix: ${{ inputs.pitboss_s3_prefix || '' }}
       enable_jira: ${{ fromJSON(inputs.enable_jira || 'true') }}
       enable_slack: ${{ fromJSON(inputs.enable_slack || 'true') }}

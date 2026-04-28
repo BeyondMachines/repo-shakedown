@@ -46,6 +46,11 @@ on:
         required: false
         type: string
         default: 'SEC'
+      shakedown_threshold:
+        description: 'Min max_risk score for a repo to be selected for scanning (default: 5)'
+        required: false
+        type: number
+        default: 5
       reprocess:
         description: 'Re-ingest pit-boss snapshots even if already processed'
         required: false
@@ -154,6 +159,7 @@ jobs:
             $SOURCE \
             --repos-dir "./repos" \
             --auto-clone \
+            --threshold "${{ inputs.shakedown_threshold }}" \
             $REPROCESS_FLAG
 
       - name: Upload scan results as artifact

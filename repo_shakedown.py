@@ -430,24 +430,35 @@ def extract_tasks_from_pitboss(
     pitboss_data: Dict,
     repos_dir: Path,
     auto_clone: bool = False,
+    threshold: int = 5,
 ) -> List[Dict]:
     """
-    Parse candidates.json and produce one task per repo.
-    Each repo entry in the JSON already carries LLM-generated scan guidance.
+    Parse pit-boss repo_risk output and produce one task per repo above threshold.
     """
     tasks = []
-    repos = pitboss_data.get("repos", [])
+    repo_risk = pitboss_data.get("repo_risk", {})
 
-    for i, repo_entry in enumerate(repos):
-        repo = repo_entry.get("repo", "")
-        repo_url = repo_entry.get("repo_url", "")
+    for i, (repo, repo_entry) in enumerate(repo_risk.items()):
         if not repo:
             continue
 
-        max_risk = repo_entry.get("max_risk_score", 0)
-        max_existing = repo_entry.get("max_existing_risk_score", 0)
-        total_criticals = repo_entry.get("critical_issue_count", 0)
+        max_risk = repo_entry.get("max_risk", 0)
+        max_existing = repo_entry.get("max_existing_risk", 0)
+        total_criticals = repo_entry.get("new_critical_count", 0)
         override_count = repo_entry.get("override_count", 0)
+
+        if max_risk < threshold:
+            continue
+
+        repo_url = f"https://github.com/{repo}"
+
+        # Derive scan depth from risk score
+        if max_risk >= 7:
+            scan_mode = "deep"
+        elif max_risk >= 4:
+            scan_mode = "default"
+        else:
+            scan_mode = "quick"
 
         # Resolve local repo path — try several naming conventions
         repo_name = repo.split("/")[-1] if "/" in repo else repo
@@ -468,13 +479,9 @@ def extract_tasks_from_pitboss(
                 print(f"  ⚠️  Repo not found at {repos_dir}/{repo_name} — skipping {repo}")
                 continue
 
-        reasoning_effort = normalize_reasoning_effort(
-            repo_entry.get("suggested_scan_mode", "default")
-        )
+        reasoning_effort = normalize_reasoning_effort(scan_mode)
+        instruction_content = generate_instruction_file(repo, repo_entry)
 
-        instruction_content = generate_instruction_file(repo_entry)
-
-        # Use index suffix to avoid collisions within the same second
         task_id = f"{repo.replace('/', '__')}__{int(time.time())}_{i}"
         instruction_path = INSTRUCTIONS_DIR / f"{task_id}.md"
         instruction_path.parent.mkdir(parents=True, exist_ok=True)
@@ -494,8 +501,6 @@ def extract_tasks_from_pitboss(
             "max_existing_risk": max_existing,
             "critical_count": total_criticals,
             "override_count": override_count,
-            "priority_score": repo_entry.get("priority_score", 0),
-            "llm_urgency": repo_entry.get("llm_urgency", ""),
             "strix_run_dir": None,
             "strix_exit_code": None,
             "report_file": None,
@@ -504,113 +509,77 @@ def extract_tasks_from_pitboss(
     return tasks
 
 
-def generate_instruction_file(repo_entry: Dict) -> str:
+def generate_instruction_file(repo: str, repo_entry: Dict) -> str:
     """
-    Generate a focused Strix instruction file from a candidates.json repo entry.
-    Uses the pre-computed LLM guidance from pit-boss directly.
+    Generate a focused Strix instruction file from pit-boss repo_risk data.
     """
-    repo = repo_entry.get("repo", "unknown")
-    scan_guidance = repo_entry.get("scan_guidance", {})
     lines = []
+
+    max_risk = repo_entry.get("max_risk", 0)
+    max_existing = repo_entry.get("max_existing_risk", 0)
+    total_prs = repo_entry.get("total_prs", 0)
+    new_critical = repo_entry.get("new_critical_count", 0)
 
     lines.append(f"# Penetration Test Instructions — {repo}")
     lines.append("")
+    lines.append("## Risk Summary")
+    lines.append("")
+    lines.append(f"- Max new risk score: {max_risk}/10")
+    lines.append(f"- Max existing risk score: {max_existing}/10")
+    lines.append(f"- New critical issues: {new_critical}")
+    lines.append(f"- PRs reviewed: {total_prs}")
+    lines.append("")
 
-    # Urgency and narrative
-    urgency = repo_entry.get("llm_urgency", "")
-    if urgency:
-        lines.append(f"## Urgency: {urgency}")
+    # Recent new issues flagged during PR reviews
+    top_new = repo_entry.get("top_new_issues", [])
+    if top_new:
+        lines.append("## Recent New Issues (from PR reviews)")
         lines.append("")
-
-    narrative = repo_entry.get("llm_narrative", "")
-    if narrative:
-        lines.append("## Context")
-        lines.append(narrative)
+        lines.append("These vulnerabilities were introduced in recent PRs — investigate further:")
         lines.append("")
-
-    # Why this repo was selected
-    reasons = repo_entry.get("reasons", [])
-    if reasons:
-        lines.append("## Why This Repo Was Selected")
-        lines.append("")
-        for r in reasons:
-            lines.append(f"- {r}")
-        lines.append("")
-
-    # Primary scan directive — LLM-generated, specific and actionable
-    scan_instructions = repo_entry.get("llm_scan_instructions", "")
-    if scan_instructions:
-        lines.append("## Scan Instructions")
-        lines.append("")
-        lines.append(scan_instructions)
+        for issue in top_new:
+            title = issue.get("title", issue) if isinstance(issue, dict) else issue
+            severity = issue.get("severity", "") if isinstance(issue, dict) else ""
+            lines.append(f"- {title}" + (f" ({severity})" if severity else ""))
         lines.append("")
 
-    # Focus areas
-    focus_areas = repo_entry.get("llm_focus_areas", [])
-    if focus_areas:
-        lines.append("## Focus Areas")
+    # Existing issues
+    top_existing = repo_entry.get("top_existing_issues", [])
+    if top_existing:
+        lines.append("## Known Existing Issues")
         lines.append("")
-        for area in focus_areas:
-            lines.append(f"- {area}")
+        lines.append("These issues were already present — confirm they are still unresolved:")
         lines.append("")
-
-    # Priority files — merge llm_priority_files and scan_guidance.priority_files
-    priority_files: List[str] = list(repo_entry.get("llm_priority_files", []))
-    for f in scan_guidance.get("priority_files", []):
-        if f not in priority_files:
-            priority_files.append(f)
-
-    if priority_files:
-        lines.append("## Priority Files")
-        lines.append("")
-        lines.append("Start the review with these files — they had the most findings:")
-        lines.append("")
-        for f in priority_files:
-            lines.append(f"- `{f}`")
+        for issue in top_existing:
+            title = issue.get("title", issue) if isinstance(issue, dict) else issue
+            severity = issue.get("severity", "") if isinstance(issue, dict) else ""
+            lines.append(f"- {title}" + (f" ({severity})" if severity else ""))
         lines.append("")
 
-    # Critical issue titles flagged during PR reviews
-    critical_titles = repo_entry.get("critical_issue_titles", [])
-    if critical_titles:
-        lines.append("## Critical Issues to Investigate")
-        lines.append("")
-        lines.append("These specific issues were flagged during PR security reviews:")
-        lines.append("")
-        for title in critical_titles:
-            lines.append(f"- {title}")
-        lines.append("")
-
-    # Existing known issues with file + severity
-    existing_issues = scan_guidance.get("existing_ai_issues", [])
-    if existing_issues:
-        lines.append("## Existing Known Issues")
+    # Existing code issues with file info
+    existing_code = repo_entry.get("existing_code_issues", [])
+    if existing_code:
+        lines.append("## Existing Code Issues")
         lines.append("")
         lines.append("| File | Title | Severity |")
         lines.append("|------|-------|----------|")
-        for issue in existing_issues:
-            f = issue.get("file", "unknown")
-            title = issue.get("title", "")
-            severity = issue.get("severity", "")
+        for issue in existing_code:
+            f = issue.get("file", "unknown") if isinstance(issue, dict) else "unknown"
+            title = issue.get("title", "") if isinstance(issue, dict) else str(issue)
+            severity = issue.get("severity", "") if isinstance(issue, dict) else ""
             lines.append(f"| `{f}` | {title} | {severity} |")
         lines.append("")
 
-    # Existing debt notes
-    debt_notes = repo_entry.get("llm_existing_debt_notes", "")
-    if debt_notes:
-        lines.append("## Existing Debt Notes")
+    # Recommendations from pit-boss
+    recommendations = repo_entry.get("recommendations", [])
+    if recommendations:
+        lines.append("## Recommendations")
         lines.append("")
-        lines.append(debt_notes)
-        lines.append("")
-
-    # Risk if ignored
-    risk_ignored = repo_entry.get("llm_risk_if_ignored", "")
-    if risk_ignored:
-        lines.append("## Risk If Ignored")
-        lines.append("")
-        lines.append(risk_ignored)
+        for r in recommendations:
+            lines.append(f"- {r}")
         lines.append("")
 
-    # General instructions (boilerplate)
+    # General instructions
     lines.append("## General Instructions")
     lines.append("")
     lines.append("- This is a source-code review scan. The repository is cloned locally.")
@@ -683,11 +652,15 @@ def cmd_prepare(args):
         source_key = pf["source_key"]
         source_name = pf.get("s3_key", pf["local_path"])
 
+        threshold = getattr(args, "threshold", 5)
+        repo_risk = data.get("repo_risk", {})
+        above = sum(1 for v in repo_risk.values() if v.get("max_risk", 0) >= threshold)
         print(f"\n📄 Processing: {source_name}")
-        print(f"   Candidates: {data.get('total_candidates', 0)}, "
-              f"Threshold: {data.get('threshold', '?')}/10")
+        print(f"   Repos in snapshot: {len(repo_risk)}, "
+              f"Above threshold ({threshold}/10): {above}")
 
-        new_tasks = extract_tasks_from_pitboss(data, repos_dir, auto_clone=auto_clone)
+        new_tasks = extract_tasks_from_pitboss(data, repos_dir, auto_clone=auto_clone,
+                                               threshold=threshold)
         added = 0
         for task in new_tasks:
             if task["repo"] in existing_repos:
@@ -1344,6 +1317,8 @@ def main():
                            help="Clone missing repos automatically using git clone")
     run_one_p.add_argument("--reprocess", action="store_true",
                            help="Ignore tracking — reprocess all files")
+    run_one_p.add_argument("--threshold", type=int, default=5,
+                           help="Min max_risk score to include a repo (default: 5)")
 
     # ── run: all-in-one for local use ──────────────────────────
     run_p = sub.add_parser("run",
@@ -1360,6 +1335,8 @@ def main():
                        help="Clone missing repos automatically using git clone")
     run_p.add_argument("--reprocess", action="store_true",
                        help="Ignore tracking — reprocess all files")
+    run_p.add_argument("--threshold", type=int, default=5,
+                       help="Min max_risk score to include a repo (default: 5)")
 
     # ── prepare: build task queue only ─────────────────────────
     prep = sub.add_parser("prepare", help="Build scan tasks from candidates.json")
@@ -1375,6 +1352,8 @@ def main():
                       help="Clone missing repos automatically using git clone")
     prep.add_argument("--reprocess", action="store_true",
                       help="Ignore tracking — reprocess all files")
+    prep.add_argument("--threshold", type=int, default=5,
+                      help="Min max_risk score to include a repo (default: 5)")
 
     # ── scan, report, status ────────────────────────────────────
     scan = sub.add_parser("scan", help="Run next pending scan")
