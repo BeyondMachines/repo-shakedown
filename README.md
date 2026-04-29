@@ -252,7 +252,7 @@ Set `SUMMARIZER_LLM` separately if you want the report summarizer to use a diffe
 
 ---
 
-## Strix Reasoning Effort
+## Strix Reasoning Effort 
 
 Strix thinking depth is controlled via `STRIX_REASONING_EFFORT`:
 
