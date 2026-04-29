@@ -61,30 +61,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    steps:
-      - uses: beyondmachines/repo-shakedown@v1
-        with:
-          # AWS / S3 — used for pit-boss data, report uploads, and monthly tracking
-          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          s3_bucket: ${{ secrets.S3_BUCKET }}
-
-          # LLM — set whichever key matches your provider
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-
-          # Notifications (optional)
-          enable_slack: 'true'
-          slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
-          enable_jira: 'true'
-          jira_base_url: ${{ secrets.JIRA_BASE_URL }}
-          jira_email: ${{ secrets.JIRA_EMAIL }}
-          jira_api_token: ${{ secrets.JIRA_API_TOKEN }}
-
-          # GitHub PAT for scanning private repos (optional)
-          repo_clone_pat: ${{ secrets.REPO_CLONE_PAT }}
+  shakedown:
+    uses: BeyondMachines/repo-shakedown/.github/workflows/repo-shakedown.yml@v1
+    with:
+      s3_bucket: "your-bucket-name"
+      enable_slack: true
+      enable_jira: true
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      REPO_CLONE_PAT: ${{ secrets.REPO_CLONE_PAT }}
 ```
 
 Each action run scans **exactly one repo** from the current pit-boss recommendations, then stops. Repos already scanned in the current calendar month are automatically skipped (tracked in `{s3_reports_prefix}/scanned_repos.json`). Run the action on a schedule and it will work through all recommendations over the course of the week.
@@ -95,29 +87,33 @@ See [`.github/workflows/example-caller.yml`](.github/workflows/example-caller.ym
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `pitboss_s3_prefix` | No | auto-detect | S3 prefix for candidates.json files. Defaults to `pitboss-snapshots/YYYY-MM/` |
-| `pitboss_json` | No | — | Local path to candidates.json (for testing without S3) |
-| `repos_dir` | No | `./repos` | Directory for cloned target repos |
-| `auto_clone` | No | `true` | Clone missing repos automatically |
-| `reprocess` | No | `false` | Re-ingest pit-boss snapshots already processed |
+| `s3_bucket` | Yes | — | S3 bucket for pit-boss data, reports, and monthly tracking |
+| `pitboss_s3_prefix` | No | auto-detect | S3 prefix for candidates.json. Defaults to `pitboss-snapshots/YYYY-MM/` |
 | `llm` | No | `gemini/gemini-2.5-pro` | LLM model for scanning and summarisation |
-| `gemini_api_key` | * | — | API key for `gemini/*` models |
-| `openai_api_key` | * | — | API key for `openai/*` models |
-| `anthropic_api_key` | * | — | API key for `anthropic/*` models |
-| `llm_api_key` | * | — | Generic fallback API key |
-| `aws_access_key_id` | No | — | AWS credentials for S3 |
-| `aws_secret_access_key` | No | — | AWS credentials for S3 |
-| `aws_region` | No | `us-east-1` | AWS region |
-| `s3_bucket` | No | — | S3 bucket for pit-boss data, reports, and monthly tracking |
-| `s3_reports_prefix` | No | `shakedown-reports/` | S3 prefix for report uploads and tracking file |
+| `s3_reports_prefix` | No | `shakedown-reports/` | S3 prefix for report uploads and `scanned_repos.json` |
 | `enable_slack` | No | `false` | Send Slack notification on completion |
-| `slack_webhook_url` | No | — | Slack incoming webhook URL |
 | `enable_jira` | No | `false` | Create a Jira ticket for each scan result |
-| `jira_base_url` | No | — | Jira instance URL |
 | `jira_project_key` | No | `SEC` | Jira project key |
-| `jira_email` | No | — | Jira auth email |
-| `jira_api_token` | No | — | Jira API token |
-| `repo_clone_pat` | No | — | GitHub PAT for cloning private target repos |
+| `shakedown_threshold` | No | `5` | Min `max_risk` score (0–10) for a repo to be scanned |
+| `reprocess` | No | `false` | Re-ingest pit-boss snapshots already processed |
+| `scripts_ref` | No | `v1` | Git ref for checking out repo-shakedown scripts |
+
+### Action Secrets
+
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `GEMINI_API_KEY` | * | API key for `gemini/*` models |
+| `OPENAI_API_KEY` | * | API key for `openai/*` models |
+| `ANTHROPIC_API_KEY` | * | API key for `anthropic/*` models |
+| `LLM_API_KEY` | * | Generic fallback API key |
+| `AWS_ACCESS_KEY_ID` | No | AWS credentials for S3 |
+| `AWS_SECRET_ACCESS_KEY` | No | AWS credentials for S3 |
+| `AWS_REGION` | No | AWS region (falls back to `us-east-1` if unset) |
+| `SLACK_WEBHOOK_URL` | No | Slack incoming webhook (required if `enable_slack: true`) |
+| `JIRA_BASE_URL` | No | Jira instance URL (required if `enable_jira: true`) |
+| `JIRA_EMAIL` | No | Jira auth email (required if `enable_jira: true`) |
+| `JIRA_API_TOKEN` | No | Jira API token (required if `enable_jira: true`) |
+| `REPO_CLONE_PAT` | No | GitHub PAT for cloning private target repos (falls back to `github.token`) |
 
 \* Set whichever key matches your chosen LLM provider.
 
