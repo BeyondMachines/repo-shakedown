@@ -92,7 +92,51 @@ on:
         required: false
 
 jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_work: ${{ steps.check.outputs.has_work }}
+    steps:
+      - name: Checkout repo-shakedown scripts
+        uses: actions/checkout@v4
+        with:
+          repository: BeyondMachines/repo-shakedown
+          path: .repo-shakedown
+          ref: ${{ inputs.scripts_ref }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: '.repo-shakedown/requirements.txt'
+
+      - name: Install Python dependencies
+        run: pip install -r .repo-shakedown/requirements.txt
+
+      - name: Run precheck
+        id: check
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION || 'us-east-1' }}
+          S3_BUCKET:             ${{ inputs.s3_bucket }}
+          S3_REPORTS_PREFIX:     ${{ inputs.s3_reports_prefix }}
+        run: |
+          if [ -n "${{ inputs.pitboss_s3_prefix }}" ]; then
+            SOURCE_PREFIX="${{ inputs.pitboss_s3_prefix }}"
+          else
+            SOURCE_PREFIX="pitboss-snapshots/$(date +%Y-%m)/"
+          fi
+
+          python .repo-shakedown/repo_shakedown.py precheck \
+            --s3-prefix "$SOURCE_PREFIX" \
+            --threshold "${{ inputs.shakedown_threshold }}"
+
   shakedown:
+    needs: precheck
+    if: needs.precheck.outputs.has_work == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 300
 
@@ -108,14 +152,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: '.repo-shakedown/requirements.txt'
 
       - name: Install Python dependencies
         run: pip install -r .repo-shakedown/requirements.txt
-
-      - name: Install Strix
-        run: |
-          curl -sSL https://strix.ai/install | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure git credentials for private repos
         env:
@@ -125,22 +166,27 @@ jobs:
             url."https://x-access-token:${CLONE_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
 
+      - name: Install Strix
+        run: |
+          curl -sSL https://strix.ai/install | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Run Shakedown — scan one repo
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_API_KEY:           ${{ secrets.LLM_API_KEY }}
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
-          S3_BUCKET: ${{ inputs.s3_bucket }}
-          S3_REPORTS_PREFIX: ${{ inputs.s3_reports_prefix }}
-          SLACK_WEBHOOK_URL: ${{ inputs.enable_slack && secrets.SLACK_WEBHOOK_URL || '' }}
-          JIRA_BASE_URL: ${{ inputs.enable_jira && secrets.JIRA_BASE_URL || '' }}
-          JIRA_PROJECT_KEY: ${{ inputs.jira_project_key }}
-          JIRA_EMAIL: ${{ inputs.enable_jira && secrets.JIRA_EMAIL || '' }}
-          JIRA_API_TOKEN: ${{ inputs.enable_jira && secrets.JIRA_API_TOKEN || '' }}
+          AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION || 'us-east-1' }}
+          S3_BUCKET:             ${{ inputs.s3_bucket }}
+          S3_REPORTS_PREFIX:     ${{ inputs.s3_reports_prefix }}
+          SLACK_WEBHOOK_URL:     ${{ inputs.enable_slack && secrets.SLACK_WEBHOOK_URL || '' }}
+          JIRA_BASE_URL:         ${{ inputs.enable_jira && secrets.JIRA_BASE_URL || '' }}
+          JIRA_PROJECT_KEY:      ${{ inputs.jira_project_key }}
+          JIRA_EMAIL:            ${{ inputs.enable_jira && secrets.JIRA_EMAIL || '' }}
+          JIRA_API_TOKEN:        ${{ inputs.enable_jira && secrets.JIRA_API_TOKEN || '' }}
         run: |
           if [ -n "${{ inputs.pitboss_s3_prefix }}" ]; then
             SOURCE="--s3-prefix ${{ inputs.pitboss_s3_prefix }}"

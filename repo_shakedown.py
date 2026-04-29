@@ -447,15 +447,17 @@ def extract_tasks_from_pitboss(
         total_criticals = repo_entry.get("new_critical_count", 0)
         override_count = repo_entry.get("override_count", 0)
 
-        if max_risk < threshold:
+        effective_risk = max(max_risk, max_existing)
+        if effective_risk < threshold:
             continue
 
         repo_url = f"https://github.com/{repo}"
 
         # Derive scan depth from risk score
-        if max_risk >= 7:
+        # Derive scan depth from whichever risk is higher
+        if effective_risk >= 7:
             scan_mode = "deep"
-        elif max_risk >= 4:
+        elif effective_risk >= 4:
             scan_mode = "default"
         else:
             scan_mode = "quick"
@@ -595,6 +597,55 @@ def generate_instruction_file(repo: str, repo_entry: Dict) -> str:
     return "\n".join(lines)
 
 
+def cmd_precheck(args):
+    """Read-only check: does any repo in the snapshots qualify for scanning?
+    Applies threshold + monthly dedup. Does NOT write tasks.json or mark
+    sources as processed. Sets GitHub Actions output 'has_work'.
+    """
+    print("=" * 60)
+    print("  repo-shakedown — Precheck (read-only)")
+    print("=" * 60)
+
+    if args.s3_prefix:
+        print(f"\n📥 Checking s3://{S3_BUCKET}/{args.s3_prefix}")
+        pitboss_files = load_pitboss_files_from_s3(args.s3_prefix)
+    else:
+        paths = args.pitboss_json if isinstance(args.pitboss_json, list) else [args.pitboss_json]
+        print(f"\n📥 Checking local files: {paths}")
+        pitboss_files = load_pitboss_files_local(paths)
+
+    has_work = False
+    candidate_count = 0
+    skipped_monthly = 0
+
+    for pf in pitboss_files:
+        repo_risk = pf["data"].get("repo_risk", {})
+        for repo, entry in repo_risk.items():
+            max_risk = entry.get("max_risk", 0)
+            max_existing = entry.get("max_existing_risk", 0)
+            if max(max_risk, max_existing) < args.threshold:
+                continue
+            if _is_repo_scanned_this_month(repo):
+                skipped_monthly += 1
+                continue
+            has_work = True
+            candidate_count += 1
+            print(f"  ✅ {repo} (new={max_risk}, existing={max_existing})")
+
+    print(f"\n📋 Precheck summary:")
+    print(f"   Qualifying repos:   {candidate_count}")
+    print(f"   Skipped (monthly):  {skipped_monthly}")
+    print(f"   Has work:           {has_work}")
+
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if output_file:
+        with open(output_file, "a") as f:
+            f.write(f"has_work={'true' if has_work else 'false'}\n")
+            f.write(f"candidate_count={candidate_count}\n")
+
+    return 0
+
+
 def cmd_prepare(args):
     """Phase 1: Read pit-boss JSON(s), generate task queue."""
     print("=" * 60)
@@ -654,7 +705,10 @@ def cmd_prepare(args):
 
         threshold = getattr(args, "threshold", 5)
         repo_risk = data.get("repo_risk", {})
-        above = sum(1 for v in repo_risk.values() if v.get("max_risk", 0) >= threshold)
+        above = sum(
+            1 for v in repo_risk.values()
+            if max(v.get("max_risk", 0), v.get("max_existing_risk", 0)) >= threshold
+        )
         print(f"\n📄 Processing: {source_name}")
         print(f"   Repos in snapshot: {len(repo_risk)}, "
               f"Above threshold ({threshold}/10): {above}")
@@ -1360,6 +1414,16 @@ def main():
     scan.add_argument("--force-reset", action="store_true",
                       help="Reset stuck 'running' tasks to 'pending'")
 
+    precheck_p = sub.add_parser("precheck",
+        help="Read-only: check whether any repo qualifies for scanning")
+    precheck_source = precheck_p.add_mutually_exclusive_group(required=True)
+    precheck_source.add_argument("--pitboss-json", nargs="+",
+        help="Path(s) to local candidates.json file(s)")
+    precheck_source.add_argument("--s3-prefix", type=str,
+        help="S3 prefix for candidates.json files")
+    precheck_p.add_argument("--threshold", type=int, default=5,
+        help="Min max(new, existing) risk score (default: 5)")
+
     sub.add_parser("report", help="Generate reports for completed scans")
     sub.add_parser("status", help="Show queue status")
 
@@ -1373,6 +1437,8 @@ def main():
         return cmd_prepare(args)
     elif args.command == "scan":
         return cmd_scan(args)
+    elif args.command == "precheck":
+        return cmd_precheck(args)
     elif args.command == "report":
         return cmd_report(args)
     elif args.command == "status":
