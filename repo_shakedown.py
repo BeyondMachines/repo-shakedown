@@ -702,8 +702,7 @@ def cmd_prepare(args):
             existing_tasks.append(task)
             existing_repos.add(task["repo"])
             added += 1
-            print(f"  ✅ {task['repo']} "
-                  f"(risk={task['max_risk']}, effort={task['reasoning_effort']})")
+            print(f"  ✅ {task['repo']} (risk={task['max_risk']})")
 
         # Mark this source as processed
         mark_source_processed(source_key)
