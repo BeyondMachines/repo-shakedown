@@ -59,7 +59,6 @@ Required env vars:
     S3_BUCKET                — S3 bucket name (pit-boss data, report uploads, monthly tracking)
 
 Optional env vars:
-    STRIX_REASONING_EFFORT   — high, medium, quick (default: high)
     S3_REPORTS_PREFIX        — S3 prefix for report uploads and scan tracking (e.g. shakedown-reports/)
     SHAKEDOWN_WORK_DIR       — Working directory (default: ./shakedown-work)
     SUMMARIZER_LLM           — Model for the report summarizer (default: same as STRIX_LLM)
@@ -115,7 +114,6 @@ RESULTS_DIR = WORK_DIR / "results"
 REPORTS_DIR = WORK_DIR / "reports"
 
 DEFAULT_LLM = "gemini/gemini-2.5-pro"
-REASONING_EFFORT = os.environ.get("STRIX_REASONING_EFFORT", "high")
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 S3_REPORTS_PREFIX = os.environ.get("S3_REPORTS_PREFIX", "")
@@ -160,13 +158,6 @@ def resolve_api_key(llm_model: str) -> str:
 
 
 # ── Repo Cloning ─────────────────────────────────────────────────
-
-def normalize_reasoning_effort(suggested_scan_mode: str) -> str:
-    """Map pit-boss suggested_scan_mode to STRIX_REASONING_EFFORT value."""
-    if suggested_scan_mode == "quick":
-        return "medium"
-    # "default", "deep", or anything else → highest effort
-    return "high"
 
 
 def clone_repo(repo: str, repos_dir: Path) -> Optional[Path]:
@@ -446,15 +437,6 @@ def extract_tasks_from_pitboss(
 
         repo_url = f"https://github.com/{repo}"
 
-        # Derive scan depth from risk score
-        # Derive scan depth from whichever risk is higher
-        if effective_risk >= 7:
-            scan_mode = "deep"
-        elif effective_risk >= 4:
-            scan_mode = "default"
-        else:
-            scan_mode = "quick"
-
         # Resolve local repo path — try several naming conventions
         repo_name = repo.split("/")[-1] if "/" in repo else repo
         repo_path = repos_dir / repo_name
@@ -474,7 +456,6 @@ def extract_tasks_from_pitboss(
                 print(f"  ⚠️  Repo not found at {repos_dir}/{repo_name} — skipping {repo}")
                 continue
 
-        reasoning_effort = normalize_reasoning_effort(scan_mode)
         instruction_content = generate_instruction_file(repo, repo_entry)
 
         task_id = f"{repo.replace('/', '__')}__{int(time.time())}_{i}"
@@ -488,7 +469,6 @@ def extract_tasks_from_pitboss(
             "repo_url": repo_url,
             "repo_path": str(repo_path.resolve()),
             "instruction_file": str(instruction_path.resolve()),
-            "reasoning_effort": reasoning_effort,
             "status": "pending",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -757,11 +737,10 @@ def run_strix(task: Dict, llm_model: str) -> int:
     """
     repo_path = task["repo_path"]
     instruction_file = task["instruction_file"]
-    reasoning_effort = task.get("reasoning_effort", REASONING_EFFORT)
 
     env = os.environ.copy()
     env["STRIX_LLM"] = llm_model
-    env["STRIX_REASONING_EFFORT"] = reasoning_effort
+    env["STRIX_REASONING_EFFORT"] = "high"
 
     # Set the right API key env var for the provider
     api_key = resolve_api_key(llm_model)
@@ -773,12 +752,13 @@ def run_strix(task: Dict, llm_model: str) -> int:
         "-n",
         "--target", repo_path,
         "--instruction-file", instruction_file,
+        "--scan-mode", "standard",
     ]
 
     print(f"\n🔍 Running Strix:")
     print(f"   Command:  {' '.join(cmd)}")
     print(f"   Target:   {repo_path}")
-    print(f"   Effort:   {reasoning_effort}")
+    print(f"   Effort:   high")
     print(f"   LLM:      {llm_model}")
     print("")
 
@@ -852,8 +832,7 @@ def cmd_scan(args):
     print(f"\n🎯 Scanning: {task['repo']}")
     print(f"   Risk: {task['max_risk']}/10 (new), {task['max_existing_risk']}/10 (existing)")
     print(f"   Criticals: {task['critical_count']}, Overrides: {task['override_count']}")
-    print(f"   Effort: {task.get('reasoning_effort', REASONING_EFFORT)}, "
-          f"Urgency: {task.get('llm_urgency', 'N/A')}")
+    print(f"   Effort: high")
 
     start_time = time.time()
     exit_code = run_strix(task, llm_model)
@@ -897,7 +876,7 @@ def cmd_scan(args):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(f.read_bytes())
         print(f"   Results: {dest}")
-        
+
     # Report
     if status == "done":
         _report_single_task(task, run_dir, args.llm)
@@ -1399,10 +1378,8 @@ def cmd_status(args):
         icon = {"pending": "⏳", "running": "🔄", "done": "✅", "failed": "❌"}.get(t["status"], "?")
         vuln = " 🚨" if t.get("vulns_found") else ""
         llm_note = f" [{t['llm_used']}]" if t.get("llm_used") else ""
-        effort = t.get("reasoning_effort", "?")
-        urgency = f" [{t['llm_urgency']}]" if t.get("llm_urgency") else ""
-        print(f"   {icon} {t['repo']} — risk {t['max_risk']}/10, "
-              f"effort={effort}{urgency}{vuln}{llm_note}")
+        print(f"   {icon} {t['repo']} — risk {t['max_risk']}/10"
+            f"{vuln}{llm_note}")
 
     return 0
 
