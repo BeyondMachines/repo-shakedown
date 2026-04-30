@@ -89,6 +89,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import csv
+import zipfile
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 
@@ -134,16 +137,6 @@ def resolve_llm(cli_llm: Optional[str] = None) -> str:
         return cli_llm
     return os.environ.get("STRIX_LLM", DEFAULT_LLM)
 
-
-def resolve_summarizer_llm(cli_llm: Optional[str] = None) -> str:
-    """
-    Resolve the model used for the Gemini summarizer (report generation).
-    Falls back to SUMMARIZER_LLM env, then the strix LLM, then default.
-    """
-    env_summarizer = os.environ.get("SUMMARIZER_LLM", "")
-    if env_summarizer:
-        return env_summarizer
-    return resolve_llm(cli_llm)
 
 
 def resolve_api_key(llm_model: str) -> str:
@@ -890,15 +883,21 @@ def cmd_scan(args):
         llm_used=llm_model,
     )
 
-    # Copy results
+    # Refresh in-memory task so the report sees exit_code, duration, etc.
+    task = next((t for t in load_tasks() if t["id"] == task["id"]), task)
+
+    # Copy results (excluding events.jsonl — large agent trace, not used)
     if run_dir and run_dir.exists():
         dest = RESULTS_DIR / task["id"]
         dest.mkdir(parents=True, exist_ok=True)
-        for f in run_dir.iterdir():
-            if f.is_file():
-                (dest / f.name).write_bytes(f.read_bytes())
+        for f in run_dir.rglob("*"):
+            if f.is_file() and f.name != "events.jsonl":
+                rel = f.relative_to(run_dir)
+                target = dest / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(f.read_bytes())
         print(f"   Results: {dest}")
-
+        
     # Report
     if status == "done":
         _report_single_task(task, run_dir, args.llm)
@@ -911,158 +910,333 @@ def cmd_scan(args):
 
 # ── Phase 3: Report ──────────────────────────────────────────────
 
-def _summarize_with_llm(strix_output: str, task: Dict, cli_llm: Optional[str] = None) -> Optional[str]:
+
+def _parse_strix_findings(run_dir: Optional[Path]) -> List[Dict[str, str]]:
+    """Read vulnerabilities.csv from the Strix run dir.
+ 
+    Returns a list of {id, title, severity, timestamp, file} dicts.
+    Empty list if the CSV is missing, empty, or unreadable.
+    Never reads events.jsonl.
     """
-    Use an LLM to produce a human-readable triage summary.
-    Tries google-genai for gemini models, falls back to litellm for others.
+    if not run_dir or not run_dir.exists():
+        return []
+ 
+    csv_path = run_dir / "vulnerabilities.csv"
+    if not csv_path.exists():
+        return []
+ 
+    try:
+        with csv_path.open() as f:
+            reader = csv.DictReader(f)
+            return [row for row in reader if row.get("id")]
+    except Exception as e:
+        print(f"  ⚠️  Could not parse vulnerabilities.csv: {e}")
+        return []
+
+
+def _read_strix_pentest_report(run_dir: Optional[Path]) -> Optional[str]:
+    """Return the contents of Strix's penetration_test_report.md, or None."""
+    if not run_dir or not run_dir.exists():
+        return None
+    report = run_dir / "penetration_test_report.md"
+    if not report.exists():
+        return None
+    try:
+        return report.read_text()
+    except Exception as e:
+        print(f"  ⚠️  Could not read penetration_test_report.md: {e}")
+        return None
+ 
+ 
+# ── Report assembly ──────────────────────────────────────────────
+ 
+def _build_pitboss_mapping_section(task: Dict, findings: List[Dict]) -> str:
+    """Prepend block that maps Strix findings to pit-boss risk context."""
+    lines = []
+    lines.append(f"# Shakedown Report: {task['repo']}")
+    lines.append("")
+    lines.append("## Pit-Boss Mapping")
+    lines.append("")
+    lines.append(f"- **Repo:** `{task['repo']}`")
+    lines.append(f"- **Source snapshot:** `{task.get('source_name', 'N/A')}`")
+    lines.append(f"- **Max NEW risk:** {task['max_risk']}/10")
+    lines.append(f"- **Max EXISTING risk:** {task['max_existing_risk']}/10")
+    lines.append(f"- **Critical issues flagged by pit-boss:** {task['critical_count']}")
+    lines.append(f"- **Override count:** {task['override_count']}")
+    lines.append(f"- **Scan duration:** {task.get('duration_seconds', 0) // 60} min")
+    lines.append(f"- **Strix exit code:** {task.get('strix_exit_code')}")
+    lines.append(f"- **LLM used:** {task.get('llm_used', 'N/A')}")
+    lines.append("")
+    lines.append("## Strix Findings Summary")
+    lines.append("")
+    if findings:
+        lines.append(f"Strix reported **{len(findings)} finding(s)**:")
+        lines.append("")
+        lines.append("| ID | Severity | Title |")
+        lines.append("|----|----------|-------|")
+        for f in findings:
+            title = f.get("title", "").replace("|", "\\|")
+            lines.append(f"| {f.get('id', '?')} | {f.get('severity', '?')} | {title} |")
+        lines.append("")
+    else:
+        lines.append("Strix produced no structured findings (no `vulnerabilities.csv`).")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
+ 
+ 
+def _assemble_report(task: Dict, run_dir: Optional[Path]) -> tuple[str, List[Dict]]:
+    """Build the full report markdown.
+ 
+    Returns (report_text, findings_list).
     """
-    summarizer_model = resolve_summarizer_llm(cli_llm)
-    api_key = resolve_api_key(summarizer_model)
-
-    if not api_key and not summarizer_model.startswith(("vertex_ai/", "bedrock/")):
-        print(f"  ⚠️  No API key found for {summarizer_model} — skipping AI summary")
-        return None
-
-    prompt = textwrap.dedent(f"""\
-    You are a senior penetration tester reviewing automated scan results
-    for repository: {task['repo']}.
-
-    The scan was guided by these pit-boss findings:
-    - Max NEW risk score: {task['max_risk']}/10
-    - Max EXISTING risk score: {task['max_existing_risk']}/10
-    - Critical issues flagged: {task['critical_count']}
-    - Overridden decisions: {task['override_count']}
-
-    Below is the Strix penetration testing output. Produce a triage report
-    for human pentesters that:
-
-    1. Lists each vulnerability found, rated CRITICAL/HIGH/MEDIUM/LOW
-    2. For each, describes a realistic exploitation scenario
-    3. Notes which findings confirm the pit-boss flags vs. new discoveries
-    4. Recommends specific manual tests the human pentester should perform
-    5. Highlights any "good catches" — security controls that held up
-
-    Keep it concise and actionable.
-
-    STRIX OUTPUT:
-    {strix_output[:12000]}
-    """)
-
-    provider = summarizer_model.split("/")[0].lower() if "/" in summarizer_model else ""
-
-    # Try google-genai for gemini models
-    if provider == "gemini":
-        return _summarize_google_genai(prompt, summarizer_model, api_key)
-
-    # Try litellm for everything else
-    return _summarize_litellm(prompt, summarizer_model, api_key)
-
-
-def _summarize_google_genai(prompt: str, model: str, api_key: str) -> Optional[str]:
-    """Summarize using google-genai SDK."""
-    try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=api_key)
-        # Strip the "gemini/" prefix for the google-genai SDK
-        model_name = model.replace("gemini/", "", 1) if model.startswith("gemini/") else model
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=4096,
-            ),
+    findings = _parse_strix_findings(run_dir)
+    mapping = _build_pitboss_mapping_section(task, findings)
+ 
+    if not findings:
+        # No structured findings → state that explicitly. Don't synthesize.
+        body = (
+            "## Result\n\n"
+            "**No findings to report.** Strix did not produce a structured "
+            "`vulnerabilities.csv`. This usually means either the scan "
+            "completed cleanly, or the scan terminated before producing "
+            "findings. Inspect the uploaded `shakedown-results.zip` for the "
+            "raw run output if needed.\n"
         )
-        return response.text
-    except ImportError:
-        print("  ⚠️  google-genai not installed. pip install google-genai")
-        return None
-    except Exception as e:
-        print(f"  ⚠️  Gemini summarization failed: {e}")
-        return None
-
-
-def _summarize_litellm(prompt: str, model: str, api_key: str) -> Optional[str]:
-    """Summarize using litellm (works with any provider)."""
-    try:
-        import litellm
-
-        if api_key:
-            os.environ["LLM_API_KEY"] = api_key
-
-        response = litellm.completion(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=4096,
+        return mapping + body, findings
+ 
+    pentest_report = _read_strix_pentest_report(run_dir)
+    if pentest_report:
+        body = "## Strix Penetration Test Report\n\n" + pentest_report
+    else:
+        body = (
+            "## Strix Penetration Test Report\n\n"
+            "_Strix reported findings in `vulnerabilities.csv` but the "
+            "consolidated `penetration_test_report.md` is not available. "
+            "See per-finding markdown files in the uploaded results zip._\n"
         )
-        return response.choices[0].message.content
-    except ImportError:
-        print("  ⚠️  litellm not installed. pip install litellm")
-        return None
+    return mapping + body, findings
+ 
+ 
+# ── S3 paths and uploads ─────────────────────────────────────────
+ 
+def _get_aws_region() -> Optional[str]:
+    """Resolve AWS region from env. No fallback."""
+    return os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or None
+ 
+ 
+def _s3_scan_prefix(task_id: str) -> str:
+    """The S3 'folder' for this scan, e.g. shakedown-reports/<task_id>/."""
+    base = S3_REPORTS_PREFIX.rstrip("/") if S3_REPORTS_PREFIX else "shakedown-reports"
+    return f"{base}/{task_id}"
+ 
+ 
+def _s3_console_url(bucket: str, key: str, region: str) -> str:
+    """Build an AWS console URL for an S3 object.
+ 
+    Uses the 'object' view so a single click opens the object detail page.
+    """
+    return (
+        f"https://{region}.console.aws.amazon.com/s3/object/"
+        f"{bucket}?region={region}&prefix={quote(key, safe='/')}"
+    )
+ 
+ 
+def _zip_run_dir(run_dir: Path, dest: Path) -> Optional[Path]:
+    """Zip the entire Strix run dir into dest. Returns dest on success."""
+    try:
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in run_dir.rglob("*"):
+                if f.is_file():
+                    zf.write(f, arcname=f.relative_to(run_dir))
+        return dest
     except Exception as e:
-        print(f"  ⚠️  LiteLLM summarization failed: {e}")
+        print(f"  ⚠️  Could not build results zip: {e}")
         return None
+ 
+ 
+def _upload_scan_to_s3(
+    task: Dict,
+    report_text: str,
+    run_dir: Optional[Path],
+) -> Optional[Dict[str, str]]:
+    """Upload report + run-dir contents + zip to S3 under <prefix>/<task_id>/.
+ 
+    Returns a dict of console URLs on success:
+        {"report_url": ..., "zip_url": ..., "report_key": ..., "zip_key": ...}
+    Returns None on any failure (caller should fall back to local).
+    """
+    if not S3_BUCKET:
+        return None
+ 
+    region = _get_aws_region()
+    if not region:
+        print("  ⚠️  No AWS_DEFAULT_REGION/AWS_REGION set — cannot build console URLs")
+        # We still try the upload; we just can't make clickable URLs
+    try:
+        import boto3
+    except ImportError:
+        print("  ⚠️  boto3 not installed — cannot upload to S3")
+        return None
+ 
+    try:
+        s3 = boto3.client("s3")
+        scan_prefix = _s3_scan_prefix(task["id"])
+        report_filename = f"{task['id']}_report.md"
+        zip_filename = "shakedown-results.zip"
+ 
+        report_key = f"{scan_prefix}/{report_filename}"
+        zip_key = f"{scan_prefix}/{zip_filename}"
+ 
+        # 1. Upload the assembled report
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=report_key,
+            Body=report_text.encode(),
+            ContentType="text/markdown",
+        )
+        print(f"  ☁️  Report uploaded: s3://{S3_BUCKET}/{report_key}")
+ 
+        # 2. Upload Strix run-dir contents (vulnerabilities.csv,
+        #    vulnerabilities/*.md, penetration_test_report.md, etc.)
+        #    Skip events.jsonl — irrelevant per requirements.
+        if run_dir and run_dir.exists():
+            for f in run_dir.rglob("*"):
+                if not f.is_file():
+                    continue
+                if f.name == "events.jsonl":
+                    continue
+                rel = f.relative_to(run_dir).as_posix()
+                key = f"{scan_prefix}/{rel}"
+                try:
+                    s3.upload_file(str(f), S3_BUCKET, key)
+                except Exception as e:
+                    print(f"  ⚠️  Failed to upload {rel}: {e}")
+ 
+            # 3. Build and upload the zip of the entire run dir (events.jsonl excluded)
+            zip_local = WORK_DIR / f"{task['id']}_results.zip"
+            zip_local.parent.mkdir(parents=True, exist_ok=True)
+            # Exclude events.jsonl from the zip too
+            try:
+                with zipfile.ZipFile(zip_local, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for f in run_dir.rglob("*"):
+                        if f.is_file() and f.name != "events.jsonl":
+                            zf.write(f, arcname=f.relative_to(run_dir).as_posix())
+                s3.upload_file(str(zip_local), S3_BUCKET, zip_key)
+                print(f"  ☁️  Results zip uploaded: s3://{S3_BUCKET}/{zip_key}")
+            except Exception as e:
+                print(f"  ⚠️  Failed to upload results zip: {e}")
+                zip_key = None
+ 
+        result = {"report_key": report_key, "zip_key": zip_key}
+        if region:
+            result["report_url"] = _s3_console_url(S3_BUCKET, report_key, region)
+            if zip_key:
+                result["zip_url"] = _s3_console_url(S3_BUCKET, zip_key, region)
+        return result
+ 
+    except Exception as e:
+        print(f"  ⚠️  S3 upload failed: {e}")
+        return None
+ 
+ 
+def _save_report_locally(task: Dict, report_text: str) -> Path:
+    """Fallback: write report to REPORTS_DIR. Always succeeds (or raises)."""
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = REPORTS_DIR / f"{task['id']}_report.md"
+    report_path.write_text(report_text)
+    print(f"  💾 Report saved locally: {report_path}")
+    return report_path
+ 
+ 
+# ── Slack ────────────────────────────────────────────────────────
+ 
+def _format_findings_for_slack(findings: List[Dict]) -> str:
+    """One line per finding: '• [SEVERITY] title'. Truncate long lists."""
+    if not findings:
+        return "_No findings reported._"
+    lines = []
+    for f in findings[:15]:
+        sev = f.get("severity", "?")
+        title = f.get("title", "(untitled)")
+        lines.append(f"• *[{sev}]* {title}")
+    if len(findings) > 15:
+        lines.append(f"_…and {len(findings) - 15} more_")
+    return "\n".join(lines)
 
 
-def _format_report_for_print(task: Dict, summary: str) -> str:
-    """Format the report for terminal output."""
-    border = "─" * 60
-    return textwrap.dedent(f"""\
-    ┌{border}┐
-    │ SHAKEDOWN REPORT: {task['repo']:<40} │
-    ├{border}┤
-    │ Risk: {task['max_risk']}/10 (new) {task['max_existing_risk']}/10 (existing){'':>16}│
-    │ Criticals: {task['critical_count']:<6} Overrides: {task['override_count']:<6}{'':>22}│
-    │ Duration: {task.get('duration_seconds', 0) // 60} min{'':>40}│
-    │ Vulns found: {'YES ⚠️' if task.get('vulns_found') else 'No'}{'':>37}│
-    └{border}┘
-
-    {summary}
-    """)
-
-
-def _send_slack_notification(task: Dict, summary: str):
-    """Send findings to Slack. Prints to console if webhook not configured."""
+def _send_slack_notification(
+    task: Dict,
+    findings: List[Dict],
+    s3_urls: Optional[Dict[str, str]],
+):
+    """Post to Slack. Lists findings from the CSV plus S3 console links.
+ 
+    Falls back to console output when SLACK_WEBHOOK_URL is unset.
+    """
+    findings_block = _format_findings_for_slack(findings)
+    vuln_count = len(findings)
+    severity_summary = (
+        ", ".join(sorted({f.get("severity", "?") for f in findings}))
+        if findings else "none"
+    )
+    headline_emoji = "🚨" if vuln_count > 0 else "✅"
+ 
+    # Build links section — always present, but says "unavailable" when missing
+    link_lines = []
+    if s3_urls and s3_urls.get("report_url"):
+        link_lines.append(f"📄 *<{s3_urls['report_url']}|Full report>*")
+    if s3_urls and s3_urls.get("zip_url"):
+        link_lines.append(f"📦 *<{s3_urls['zip_url']}|Results zip>*")
+    if not link_lines:
+        link_lines.append("_Report links unavailable (S3 upload skipped or failed; "
+                          "check GitHub Actions artifact)._")
+    links_block = "\n".join(link_lines)
+ 
     if not SLACK_WEBHOOK_URL:
-        print("\n  📨 Slack webhook not configured — printing report to console:")
-        print(_format_report_for_print(task, summary))
+        print("\n  📨 Slack webhook not configured — printing summary to console:")
+        print(f"  {headline_emoji} Shakedown: {task['repo']}")
+        print(f"     Risk: new={task['max_risk']}/10, existing={task['max_existing_risk']}/10")
+        print(f"     Findings: {vuln_count} ({severity_summary})")
+        print(f"     {findings_block}")
+        print(f"     {links_block}")
         return
-
+ 
     try:
         import urllib.request
-
-        truncated = summary[:2800] if len(summary) > 2800 else summary
-        vulns_emoji = "🚨" if task.get("vulns_found") else "✅"
-
         payload = {
             "blocks": [
                 {
                     "type": "header",
                     "text": {
                         "type": "plain_text",
-                        "text": f"{vulns_emoji} Shakedown: {task['repo']}"
-                    }
+                        "text": f"{headline_emoji} Shakedown: {task['repo']}",
+                    },
                 },
                 {
                     "type": "section",
                     "fields": [
-                        {"type": "mrkdwn", "text": f"*Risk:* {task['max_risk']}/10"},
-                        {"type": "mrkdwn", "text": f"*Mode:* {task.get('scan_mode', 'standard')}"},
-                        {"type": "mrkdwn", "text": f"*Criticals:* {task['critical_count']}"},
-                        {"type": "mrkdwn", "text": f"*Duration:* {task.get('duration_seconds', 0) // 60}m"},
-                    ]
+                        {"type": "mrkdwn",
+                         "text": f"*New risk:* {task['max_risk']}/10"},
+                        {"type": "mrkdwn",
+                         "text": f"*Existing risk:* {task['max_existing_risk']}/10"},
+                        {"type": "mrkdwn",
+                         "text": f"*Findings:* {vuln_count} ({severity_summary})"},
+                        {"type": "mrkdwn",
+                         "text": f"*Duration:* {task.get('duration_seconds', 0) // 60}m"},
+                    ],
                 },
                 {
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"```{truncated}```"}
-                }
+                    "text": {"type": "mrkdwn", "text": findings_block[:2900]},
+                },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": links_block},
+                },
             ]
         }
-
         req = urllib.request.Request(
             SLACK_WEBHOOK_URL,
             data=json.dumps(payload).encode(),
@@ -1070,54 +1244,52 @@ def _send_slack_notification(task: Dict, summary: str):
         )
         urllib.request.urlopen(req, timeout=10)
         print("  📨 Slack notification sent")
-
     except Exception as e:
         print(f"  ⚠️  Slack notification failed: {e}")
-        print("  Falling back to console output:")
-        print(_format_report_for_print(task, summary))
+        print(f"     Findings: {findings_block}")
+        print(f"     {links_block}")
 
 
-def _create_jira_ticket(task: Dict, summary: str):
-    """Create a Jira ticket. Prints to console if Jira not configured."""
+def _create_jira_ticket(task: Dict, report_text: str, findings: List[Dict]):
+    """Create a Jira ticket using the assembled report as the body."""
     if not all([JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN]):
-        if task.get("vulns_found"):
-            print("\n  🎫 Jira not configured — printing ticket content:")
-            print(f"     Title: [Shakedown] {task['repo']} — Risk {task['max_risk']}/10")
-            print(f"     Priority: {'High' if task.get('vulns_found') else 'Medium'}")
-            print(f"     Labels: security-vuln-found, repo-shakedown, automated")
-            print(f"     Body: (see report file)")
+        if findings:
+            print("\n  🎫 Jira not configured — would have filed:")
+            print(f"     Title: [Shakedown] {task['repo']} — "
+                  f"{len(findings)} finding(s)")
         return
-
+ 
     try:
         import urllib.request
         import base64
-
-        priority = "High" if task.get("vulns_found") else "Medium"
-        label = "security-vuln-found" if task.get("vulns_found") else "security-review"
-
+ 
+        priority = "High" if findings else "Medium"
+        label = "security-vuln-found" if findings else "security-review"
+ 
         payload = {
             "fields": {
                 "project": {"key": JIRA_PROJECT_KEY},
-                "summary": f"[Shakedown] {task['repo']} — Risk {task['max_risk']}/10",
+                "summary": (f"[Shakedown] {task['repo']} — "
+                            f"{len(findings)} finding(s), risk "
+                            f"{task['max_risk']}/{task['max_existing_risk']}"),
                 "description": {
                     "type": "doc",
                     "version": 1,
-                    "content": [
-                        {
-                            "type": "paragraph",
-                            "content": [{"type": "text", "text": summary[:30000]}]
-                        }
-                    ]
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{"type": "text",
+                                     "text": report_text[:30000]}],
+                    }],
                 },
                 "issuetype": {"name": "Task"},
                 "priority": {"name": priority},
                 "labels": [label, "repo-shakedown", "automated"],
             }
         }
-
-        auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+        auth = base64.b64encode(
+            f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()
+        ).decode()
         url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/issue"
-
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode(),
@@ -1129,85 +1301,55 @@ def _create_jira_ticket(task: Dict, summary: str):
         resp = urllib.request.urlopen(req, timeout=15)
         result = json.loads(resp.read())
         print(f"  🎫 Jira ticket created: {result.get('key', '?')}")
-
     except Exception as e:
         print(f"  ⚠️  Jira ticket creation failed: {e}")
-        print(f"     Title would be: [Shakedown] {task['repo']} — Risk {task['max_risk']}/10")
 
 
-def _report_single_task(task: Dict, run_dir: Optional[Path], cli_llm: Optional[str] = None):
-    """Generate report and send notifications for a completed scan."""
+def _report_single_task(
+    task: Dict,
+    run_dir: Optional[Path],
+    cli_llm: Optional[str] = None,  # kept for signature compatibility; unused
+):
+    """Generate the report from Strix's structured output and notify.
+ 
+    Pipeline:
+      1. Parse vulnerabilities.csv → findings list (or empty)
+      2. Read penetration_test_report.md verbatim → body
+         (or "no findings" message if no CSV)
+      3. Prepend pit-boss mapping section
+      4. Upload report + run-dir + zip to S3 (primary)
+      5. If S3 fails or is unconfigured → save report to REPORTS_DIR
+      6. Slack: lists findings + S3 console URLs
+      7. Jira: ticket with the report as the body
+    """
     print(f"\n📝 Generating report for {task['repo']} ...")
-
-    strix_output = ""
-    if run_dir and run_dir.exists():
-        events_file = run_dir / "events.jsonl"
-        if events_file.exists():
-            strix_output = events_file.read_text()
-        else:
-            for f in sorted(run_dir.iterdir()):
-                if f.suffix in (".txt", ".md", ".json", ".jsonl"):
-                    strix_output += f"\n--- {f.name} ---\n"
-                    strix_output += f.read_text()[:5000]
-
-    if not strix_output:
-        strix_output = "(No Strix output captured)"
-
-    # AI-powered summary
-    summary = _summarize_with_llm(strix_output, task, cli_llm)
-
-    if not summary:
-        summary = textwrap.dedent(f"""\
-        ## Shakedown Report: {task['repo']}
-
-        Scan completed {'with vulnerabilities found' if task.get('vulns_found') else 'clean'}.
-        - Max NEW risk: {task['max_risk']}/10
-        - Max EXISTING risk: {task['max_existing_risk']}/10
-        - Critical issues flagged: {task['critical_count']}
-        - Scan mode: {task.get('scan_mode', 'standard')}
-        - Duration: {task.get('duration_seconds', 0) // 60} minutes
-        - Strix output: {task.get('strix_run_dir', 'N/A')}
-
-        Manual review recommended.
-        """)
-
-    # Save report locally
-    report_path = REPORTS_DIR / f"{task['id']}_report.md"
-    report_path.write_text(summary)
-    print(f"   Report saved: {report_path}")
-
-    # Upload to S3 if configured
-    _upload_report_to_s3(report_path, task)
-
+ 
+    report_text, findings = _assemble_report(task, run_dir)
+ 
+    # Try S3 first
+    s3_urls = _upload_scan_to_s3(task, report_text, run_dir)
+ 
+    # Track where the report ended up so the task record points to it
+    if s3_urls and s3_urls.get("report_key"):
+        report_location = f"s3://{S3_BUCKET}/{s3_urls['report_key']}"
+    else:
+        # Fallback: write to local REPORTS_DIR (picked up by GHA artifact)
+        local_path = _save_report_locally(task, report_text)
+        report_location = str(local_path)
+ 
+    # Update the task record
     tasks = load_tasks()
-    update_task_status(tasks, task["id"], task.get("status", "done"),
-                       report_file=str(report_path))
-
-    # Notifications — graceful fallback to print
-    _send_slack_notification(task, summary)
-    _create_jira_ticket(task, summary)
-
-    # Record repo as scanned this month so it is skipped if pit-boss recommends it again
+    update_task_status(
+        tasks, task["id"], task.get("status", "done"),
+        report_file=report_location,
+    )
+ 
+    # Notify
+    _send_slack_notification(task, findings, s3_urls)
+    _create_jira_ticket(task, report_text, findings)
+ 
+    # Monthly dedup
     _mark_repo_scanned_this_month(task["repo"])
-
-
-def _upload_report_to_s3(report_path: Path, task: Dict):
-    """Upload report to S3. Silent no-op if S3_REPORTS_PREFIX is not configured."""
-    if not S3_REPORTS_PREFIX:
-        return
-    if not S3_BUCKET:
-        print("  ⚠️  S3_REPORTS_PREFIX is set but S3_BUCKET is empty — skipping upload")
-        return
-    try:
-        import boto3
-        s3 = boto3.client("s3")
-        key = f"{S3_REPORTS_PREFIX.rstrip('/')}/{report_path.name}"
-        s3.upload_file(str(report_path), S3_BUCKET, key)
-        print(f"  ☁️  Report uploaded: s3://{S3_BUCKET}/{key}")
-    except ImportError:
-        print("  ⚠️  boto3 not installed — skipping S3 upload. pip install boto3")
-    except Exception as e:
-        print(f"  ⚠️  S3 report upload failed: {e}")
 
 
 def cmd_report(args):
@@ -1350,7 +1492,7 @@ def main():
 
     # Global --llm flag available to all subcommands
     p.add_argument("--llm", type=str, default=None,
-                   help="LLM model for Strix and summarizer "
+                   help="LLM model for Strix "
                         "(e.g. gemini/gemini-2.5-pro, openai/gpt-5)")
 
     sub = p.add_subparsers(dest="command", required=True)

@@ -340,7 +340,6 @@ Shows current queue status with risk scores, reasoning effort, and LLM used per 
 | `OPENAI_API_KEY` | * | API key for `openai/*` models |
 | `ANTHROPIC_API_KEY` | * | API key for `anthropic/*` models |
 | `LLM_API_KEY` | * | Generic fallback API key |
-| `SUMMARIZER_LLM` | No | Separate model for report summariser |
 | `STRIX_REASONING_EFFORT` | No | `high`, `medium`, or `quick` (default: `high`) |
 | `S3_REPORTS_PREFIX` | No | S3 prefix for report uploads and `scanned_repos.json` (e.g. `shakedown-reports/`) |
 | `SHAKEDOWN_WORK_DIR` | No | Working directory (default: `./shakedown-work`) |
