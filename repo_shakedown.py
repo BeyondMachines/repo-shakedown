@@ -129,6 +129,7 @@ SCANNED_REPOS_LOCAL = WORK_DIR / "scanned_repos.json"
 _scanned_repos_cache: Optional[Dict[str, List[str]]] = None
 
 
+
 def resolve_llm(cli_llm: Optional[str] = None) -> str:
     """Resolve LLM model string. Priority: CLI flag > env > default."""
     if cli_llm:
@@ -407,35 +408,386 @@ def load_pitboss_files_local(file_paths: List[str]) -> List[Dict]:
 
     return results
 
+def _classify_pitboss_file(data: Dict) -> str:
+    """
+    Identify which kind of pit-boss file this is by structure, not filename.
+    Returns 'candidates', 'snapshot', or 'unknown'.
+
+    - candidates: top-level 'repos' array (output of ShakedownCandidateBuilder)
+    - snapshot: top-level 'repo_risk' dict + 'pr_records_compact'
+                (output of ReviewCorrelator.to_snapshot)
+    - other 'repo_risk'-shaped files (monthly analyses, aggregates) are
+      treated as snapshots — they have the same per-repo shape.
+    """
+    if not isinstance(data, dict):
+        return "unknown"
+    if "repos" in data and "generated_by" in data:
+        return "candidates"
+    if "repo_risk" in data:
+        return "snapshot"
+    return "unknown"
+
+
+def _extract_week_label(pf: Dict) -> Optional[str]:
+    """
+    Pull the week label out of a pit-boss file dict (as returned by
+    load_pitboss_files_from_s3 / load_pitboss_files_local).
+
+    Snapshots store 'week_label' in their data. Candidates files store the
+    label in 'period' OR encode it in the S3 key like
+    'shakedown/2026-04-d28-30/candidates.json'.
+    Returns None if no label can be determined.
+    """
+    data = pf.get("data", {})
+
+    # Snapshot — stored explicitly
+    label = data.get("week_label")
+    if label:
+        return label
+
+    # Candidates — sometimes in 'period'
+    label = data.get("period")
+    if label:
+        return label
+
+    # Fallback: parse from S3 key path
+    s3_key = pf.get("s3_key", "")
+    if s3_key:
+        parts = s3_key.split("/")
+        # Expect e.g. 'shakedown/2026-04-d28-30/candidates.json'
+        if len(parts) >= 2:
+            return parts[-2]
+
+    return None
+
+
+def _pair_files_by_label(
+    pitboss_files: List[Dict],
+) -> Dict[str, Dict[str, Optional[Dict]]]:
+    """
+    Group loaded pit-boss files by week label, pairing each snapshot with its
+    matching candidates file.
+
+    Returns:
+        { '2026-04-d28-30': {'snapshot': <pf>, 'candidates': <pf>}, ... }
+
+    A label may have only a snapshot, only a candidates file, or both.
+    Files we can't classify or label are dropped with a warning.
+    """
+    paired: Dict[str, Dict[str, Optional[Dict]]] = {}
+
+    for i, pf in enumerate(pitboss_files):
+        kind = _classify_pitboss_file(pf.get("data", {}))
+        if kind == "unknown":
+            print(f"  ⚠️  Unrecognized pit-boss file shape: "
+                  f"{pf.get('s3_key', pf.get('local_path'))}")
+            continue
+
+        label = _extract_week_label(pf)
+        if not label:
+            # No label available (e.g. local file, or empty 'period' field).
+            # Synthesize one. Pairing is meaningless without a real label,
+            # but we still want to process the file's contents.
+            label = f"_unlabeled_{kind}_{i}"
+
+        bucket = paired.setdefault(label, {"snapshot": None, "candidates": None})
+
+        # If we somehow get two of the same kind for one label, prefer the
+        # one with more data (candidates with more repos, snapshot with more
+        # PR records). Defensive — should not normally happen.
+        existing = bucket[kind]
+        if existing is None:
+            bucket[kind] = pf
+        else:
+            cur_repos = len(pf["data"].get("repos", [])) \
+                or len(pf["data"].get("repo_risk", {}))
+            old_repos = len(existing["data"].get("repos", [])) \
+                or len(existing["data"].get("repo_risk", {}))
+            if cur_repos > old_repos:
+                bucket[kind] = pf
+
+    return paired
+
+
+def _merge_repo_data(
+    repo: str,
+    snapshot_repo: Optional[Dict],
+    candidate_repo: Optional[Dict],
+    snapshot_pr_records: Optional[List[Dict]] = None,
+) -> Dict[str, Any]:
+    """
+    Merge a single repo's data from snapshot and candidates files.
+
+    Rules:
+      - Snapshot wins on PR-level granular data (top_*, existing_code_issues,
+        recommendations, breaking_changes, tool_findings, pr_records).
+      - Candidates wins on prioritization (priority_score, suggested_scan_mode,
+        qualified_by, reasons).
+      - Candidates wins on targeting (scan_guidance, critical_issue_titles).
+      - LLM fields (llm_*) only present when Gemini ran for this repo.
+      - When a repo appears in only one file, fields from the other are absent
+        and downstream code (instruction generation) must handle their absence.
+
+    Either snapshot_repo or candidate_repo may be None — at least one must be
+    provided.
+    """
+    if not snapshot_repo and not candidate_repo:
+        return {}
+
+    merged: Dict[str, Any] = {"repo": repo}
+
+    # ── Snapshot-derived fields (PR-level granularity) ───────
+    if snapshot_repo:
+        merged.update({
+            "max_risk": snapshot_repo.get("max_risk", 0),
+            "max_existing_risk": snapshot_repo.get("max_existing_risk", 0),
+            "avg_risk": snapshot_repo.get("avg_risk", 0),
+            "avg_existing_risk": snapshot_repo.get("avg_existing_risk", 0),
+            "new_critical_count": snapshot_repo.get("new_critical_count", 0),
+            "existing_critical_count": snapshot_repo.get("existing_critical_count", 0),
+            "critical_count": snapshot_repo.get("critical_count", 0),
+            "override_count": snapshot_repo.get("override_count", 0),
+            "fix_count": snapshot_repo.get("fix_count", 0),
+            "persist_count": snapshot_repo.get("persist_count", 0),
+            "total_prs": snapshot_repo.get("total_prs", 0),
+            "total_scans": snapshot_repo.get("total_scans", 0),
+            "top_new_issues": snapshot_repo.get("top_new_issues", []),
+            "top_existing_issues": snapshot_repo.get("top_existing_issues", []),
+            "top_issues": snapshot_repo.get("top_issues", []),
+            "existing_code_issues": snapshot_repo.get("existing_code_issues", []),
+            "recommendations": snapshot_repo.get("recommendations", []),
+            "breaking_changes": snapshot_repo.get("breaking_changes", []),
+            "tool_findings": snapshot_repo.get("tool_findings", {}),
+        })
+
+    # ── Candidate-derived fields (priority + targeting + LLM) ────
+    if candidate_repo:
+        # Candidates uses '*_score' suffix — normalize to match snapshot
+        if "max_risk_score" in candidate_repo:
+            merged["max_risk"] = max(
+                merged.get("max_risk", 0),
+                candidate_repo["max_risk_score"],
+            )
+        if "max_existing_risk_score" in candidate_repo:
+            merged["max_existing_risk"] = max(
+                merged.get("max_existing_risk", 0),
+                candidate_repo["max_existing_risk_score"],
+            )
+
+        # Counts — take max if both sources have them (candidates is canonical)
+        for key in ("new_critical_count", "existing_critical_count",
+                    "override_count", "fix_count", "persist_count"):
+            if key in candidate_repo:
+                merged[key] = max(merged.get(key, 0), candidate_repo[key])
+
+        merged.update({
+            "priority_score": candidate_repo.get("priority_score", 0),
+            "suggested_scan_mode": candidate_repo.get("suggested_scan_mode",
+                                                      "default"),
+            "qualified_by": candidate_repo.get("qualified_by", {}),
+            "reasons": candidate_repo.get("reasons", []),
+            "critical_issue_titles": candidate_repo.get(
+                "critical_issue_titles", []),
+            "scan_guidance": candidate_repo.get("scan_guidance", {}),
+            "repo_url": candidate_repo.get("repo_url",
+                                           f"https://github.com/{repo}"),
+        })
+
+        # LLM enrichment — only present when Gemini ran for this repo.
+        # Use .get() with None default so absence is detectable downstream.
+        for key in ("llm_urgency", "llm_narrative", "llm_focus_areas",
+                    "llm_priority_files", "llm_scan_instructions",
+                    "llm_existing_debt_notes", "llm_risk_if_ignored"):
+            if key in candidate_repo:
+                merged[key] = candidate_repo[key]
+
+    # ── PR-level evidence from the snapshot ─────────────────
+    if snapshot_pr_records:
+        merged["pr_records"] = [
+            p for p in snapshot_pr_records
+            if p.get("repo") == repo
+        ]
+    else:
+        merged["pr_records"] = []
+
+    # Default values for fields not provided by either source
+    merged.setdefault("repo_url", f"https://github.com/{repo}")
+    merged.setdefault("priority_score", 0)
+    merged.setdefault("suggested_scan_mode", "default")
+    merged.setdefault("reasons", [])
+
+    return merged
+
+
+def build_merged_repo_index(
+    pitboss_files: List[Dict],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Top-level merge entry point.
+
+    Pairs all loaded pit-boss files by week label, then merges per-repo across
+    snapshot and candidates within each label. Returns a single
+    {repo -> merged_data} dict.
+
+    When a repo appears in multiple weeks, the latest week's data wins for
+    targeting fields, but counts/criticals are summed across weeks.
+    """
+    paired = _pair_files_by_label(pitboss_files)
+
+    if not paired:
+        return {}
+
+    # Sort labels chronologically so that "latest wins" for targeting fields.
+    # Labels look like '2026-04-d28-30' or '2026-04' — string sort works.
+    sorted_labels = sorted(paired.keys())
+
+    merged_repos: Dict[str, Dict[str, Any]] = {}
+
+    for label in sorted_labels:
+        bucket = paired[label]
+        snap_pf = bucket.get("snapshot")
+        cand_pf = bucket.get("candidates")
+
+        snapshot_repo_risk = (snap_pf or {}).get(
+            "data", {}).get("repo_risk", {})
+        snapshot_pr_records = (snap_pf or {}).get(
+            "data", {}).get("pr_records_compact", [])
+        candidates_repos = {
+            c["repo"]: c
+            for c in (cand_pf or {}).get("data", {}).get("repos", [])
+            if c.get("repo")
+        }
+
+        # Union of all repos present in either source for this label
+        all_repos = set(snapshot_repo_risk.keys()) | set(candidates_repos.keys())
+
+        for repo in all_repos:
+            week_merged = _merge_repo_data(
+                repo,
+                snapshot_repo=snapshot_repo_risk.get(repo),
+                candidate_repo=candidates_repos.get(repo),
+                snapshot_pr_records=snapshot_pr_records,
+            )
+            if not week_merged:
+                continue
+
+            # Combine across weeks for the same repo
+            existing = merged_repos.get(repo)
+            if not existing:
+                merged_repos[repo] = week_merged
+                continue
+
+            # Sum counts; take max of risk scores; latest week's
+            # targeting/LLM fields win (we got there via sorted iteration)
+            for count_key in ("new_critical_count", "existing_critical_count",
+                              "override_count", "fix_count", "persist_count",
+                              "total_prs", "total_scans"):
+                existing[count_key] = (
+                    existing.get(count_key, 0)
+                    + week_merged.get(count_key, 0)
+                )
+            for max_key in ("max_risk", "max_existing_risk", "priority_score"):
+                existing[max_key] = max(
+                    existing.get(max_key, 0),
+                    week_merged.get(max_key, 0),
+                )
+
+            # Targeting/LLM fields: latest week wins. Only overwrite if
+            # the new week has data for that field.
+            for tgt_key in ("priority_score", "suggested_scan_mode",
+                            "qualified_by", "reasons", "critical_issue_titles",
+                            "scan_guidance", "llm_urgency", "llm_narrative",
+                            "llm_focus_areas", "llm_priority_files",
+                            "llm_scan_instructions", "llm_existing_debt_notes",
+                            "llm_risk_if_ignored"):
+                if week_merged.get(tgt_key):
+                    existing[tgt_key] = week_merged[tgt_key]
+
+            # Append PR records, top issues, etc. (let downstream dedupe
+            # if needed)
+            existing["pr_records"] = (
+                existing.get("pr_records", []) + week_merged.get("pr_records", [])
+            )
+            for list_key in ("top_new_issues", "top_existing_issues",
+                             "top_issues", "existing_code_issues",
+                             "recommendations", "breaking_changes"):
+                if week_merged.get(list_key):
+                    existing.setdefault(list_key, [])
+                    existing[list_key].extend(week_merged[list_key])
+
+    return merged_repos
+
+
+def _filter_files_by_month(
+    pitboss_files: List[Dict],
+    month: Optional[str],
+) -> List[Dict]:
+    """
+    Filter loaded files to only those matching the given month label.
+    `month` is in 'YYYY-MM' format. Files whose label doesn't start with the
+    month are dropped.
+
+    If month is None or empty, returns all files unchanged.
+    """
+    if not month:
+        return pitboss_files
+
+    kept = []
+    for pf in pitboss_files:
+        label = _extract_week_label(pf)
+        if label and label.startswith(month):
+            kept.append(pf)
+        else:
+            print(f"  ⏭️  Skipping file outside month {month}: "
+                  f"{pf.get('s3_key', pf.get('local_path'))} (label={label})")
+    return kept
+
 
 # ── Phase 1: Prepare ─────────────────────────────────────────────
 
-def extract_tasks_from_pitboss(
-    pitboss_data: Dict,
+
+def extract_tasks_from_merged(
+    merged_repos: Dict[str, Dict[str, Any]],
     repos_dir: Path,
     auto_clone: bool = False,
     threshold: int = 5,
 ) -> List[Dict]:
     """
-    Parse pit-boss repo_risk output and produce one task per repo above threshold.
+    Build scan tasks from merged repo data (snapshot + candidates).
+
+    A repo qualifies if:
+      - effective_risk = max(max_risk, max_existing_risk) >= threshold, OR
+      - it has any priority_score > 0 (means pit-boss already flagged it)
+
+    Tasks are returned sorted by priority_score descending. When two repos
+    have the same priority_score, the higher max_risk wins.
     """
     tasks = []
-    repo_risk = pitboss_data.get("repo_risk", {})
 
-    for i, (repo, repo_entry) in enumerate(repo_risk.items()):
+    # Sort by priority_score desc, then max_risk desc
+    sorted_repos = sorted(
+        merged_repos.items(),
+        key=lambda kv: (
+            kv[1].get("priority_score", 0),
+            kv[1].get("max_risk", 0),
+        ),
+        reverse=True,
+    )
+
+    for i, (repo, data) in enumerate(sorted_repos):
         if not repo:
             continue
 
-        max_risk = repo_entry.get("max_risk", 0)
-        max_existing = repo_entry.get("max_existing_risk", 0)
-        total_criticals = repo_entry.get("new_critical_count", 0)
-        override_count = repo_entry.get("override_count", 0)
+        max_risk = data.get("max_risk", 0)
+        max_existing = data.get("max_existing_risk", 0)
+        priority = data.get("priority_score", 0)
 
         effective_risk = max(max_risk, max_existing)
-        if effective_risk < threshold:
+        # Qualify on either threshold OR pit-boss-determined priority
+        if effective_risk < threshold and priority <= 0:
             continue
 
-        repo_url = f"https://github.com/{repo}"
+        repo_url = data.get("repo_url", f"https://github.com/{repo}")
 
         # Resolve local repo path — try several naming conventions
         repo_name = repo.split("/")[-1] if "/" in repo else repo
@@ -453,15 +805,21 @@ def extract_tasks_from_pitboss(
                 repo_path = cloned
                 print(f"  🔁 Cloned {repo} → {repo_path}")
             else:
-                print(f"  ⚠️  Repo not found at {repos_dir}/{repo_name} — skipping {repo}")
+                print(f"  ⚠️  Repo not found at {repos_dir}/{repo_name} — "
+                      f"skipping {repo}")
                 continue
 
-        instruction_content = generate_instruction_file(repo, repo_entry)
+        instruction_content = generate_instruction_file(repo, data)
 
         task_id = f"{repo.replace('/', '__')}__{int(time.time())}_{i}"
         instruction_path = INSTRUCTIONS_DIR / f"{task_id}.md"
         instruction_path.parent.mkdir(parents=True, exist_ok=True)
         instruction_path.write_text(instruction_content)
+
+        # Determine scan mode and reasoning effort from pit-boss suggestion.
+        # PR2 will wire these through to Strix; for now, just persist them
+        # so the task carries the data forward.
+        scan_mode = data.get("suggested_scan_mode", "default")
 
         tasks.append({
             "id": task_id,
@@ -472,17 +830,24 @@ def extract_tasks_from_pitboss(
             "status": "pending",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            # Risk + counts
             "max_risk": max_risk,
             "max_existing_risk": max_existing,
-            "critical_count": total_criticals,
-            "override_count": override_count,
+            "critical_count": data.get("new_critical_count", 0),
+            "override_count": data.get("override_count", 0),
+            # New fields from merged data
+            "priority_score": priority,
+            "suggested_scan_mode": scan_mode,
+            "reasons": data.get("reasons", []),
+            "qualified_by": data.get("qualified_by", {}),
+            "has_llm_enrichment": bool(data.get("llm_scan_instructions")),
+            # Strix run results (filled during scan)
             "strix_run_dir": None,
             "strix_exit_code": None,
             "report_file": None,
         })
 
     return tasks
-
 
 def generate_instruction_file(repo: str, repo_entry: Dict) -> str:
     """
@@ -570,8 +935,65 @@ def generate_instruction_file(repo: str, repo_entry: Dict) -> str:
     return "\n".join(lines)
 
 
+def _load_pitboss_files_dual(args) -> List[Dict]:
+    """
+    Load pit-boss files from the appropriate source based on args.
+
+    Priority order:
+      1. If --pitboss-json given: local files (legacy).
+      2. If --snapshots-prefix and/or --candidates-prefix given: dual-source.
+      3. If --s3-prefix given (legacy): single-source S3, treated as snapshots.
+
+    Returns a list of pitboss file dicts, possibly filtered by --month.
+    """
+    pitboss_files: List[Dict] = []
+
+    # Mode 1: local files (legacy, unchanged)
+    if getattr(args, "pitboss_json", None):
+        paths = (args.pitboss_json
+                 if isinstance(args.pitboss_json, list)
+                 else [args.pitboss_json])
+        print(f"\n📥 Loading from local files ...")
+        pitboss_files = load_pitboss_files_local(paths)
+
+    # Mode 2: dual S3 prefixes (new — PR1 default for GHA)
+    elif (getattr(args, "snapshots_prefix", None)
+          or getattr(args, "candidates_prefix", None)):
+        snap_prefix = getattr(args, "snapshots_prefix", "") or ""
+        cand_prefix = getattr(args, "candidates_prefix", "") or ""
+
+        if snap_prefix:
+            print(f"\n📥 Loading snapshots from "
+                  f"s3://{S3_BUCKET}/{snap_prefix}")
+            pitboss_files.extend(load_pitboss_files_from_s3(snap_prefix))
+
+        if cand_prefix:
+            print(f"\n📥 Loading candidates from "
+                  f"s3://{S3_BUCKET}/{cand_prefix}")
+            pitboss_files.extend(load_pitboss_files_from_s3(cand_prefix))
+
+    # Mode 3: legacy single prefix
+    elif getattr(args, "s3_prefix", None):
+        print(f"\n📥 Loading from S3: s3://{S3_BUCKET}/{args.s3_prefix}")
+        pitboss_files = load_pitboss_files_from_s3(args.s3_prefix)
+
+    else:
+        return []
+
+    # Optional month filter (caller-provided convention: "YYYY-MM")
+    month = getattr(args, "month", None)
+    if month:
+        before = len(pitboss_files)
+        pitboss_files = _filter_files_by_month(pitboss_files, month)
+        if len(pitboss_files) < before:
+            print(f"   Month filter ({month}): "
+                  f"{before} files → {len(pitboss_files)} files")
+
+    return pitboss_files
+
 def cmd_precheck(args):
-    """Read-only check: does any repo in the snapshots qualify for scanning?
+    """Read-only check: does any repo qualify for scanning?
+
     Applies threshold + monthly dedup. Does NOT write tasks.json or mark
     sources as processed. Sets GitHub Actions output 'has_work'.
     """
@@ -579,31 +1001,43 @@ def cmd_precheck(args):
     print("  repo-shakedown — Precheck (read-only)")
     print("=" * 60)
 
-    if args.s3_prefix:
-        print(f"\n📥 Checking s3://{S3_BUCKET}/{args.s3_prefix}")
-        pitboss_files = load_pitboss_files_from_s3(args.s3_prefix)
-    else:
-        paths = args.pitboss_json if isinstance(args.pitboss_json, list) else [args.pitboss_json]
-        print(f"\n📥 Checking local files: {paths}")
-        pitboss_files = load_pitboss_files_local(paths)
+    pitboss_files = _load_pitboss_files_dual(args)
+    if not pitboss_files:
+        print("\n⚠️  No pit-boss files to check.")
+        output_file = os.environ.get("GITHUB_OUTPUT")
+        if output_file:
+            with open(output_file, "a") as f:
+                f.write("has_work=false\n")
+                f.write("candidate_count=0\n")
+        return 0
+
+    merged = build_merged_repo_index(pitboss_files)
+    print(f"\n   Merged index: {len(merged)} unique repos across all sources")
 
     has_work = False
     candidate_count = 0
     skipped_monthly = 0
 
-    for pf in pitboss_files:
-        repo_risk = pf["data"].get("repo_risk", {})
-        for repo, entry in repo_risk.items():
-            max_risk = entry.get("max_risk", 0)
-            max_existing = entry.get("max_existing_risk", 0)
-            if max(max_risk, max_existing) < args.threshold:
-                continue
-            if _is_repo_scanned_this_month(repo):
-                skipped_monthly += 1
-                continue
-            has_work = True
-            candidate_count += 1
-            print(f"  ✅ {repo} (new={max_risk}, existing={max_existing})")
+    for repo, data in merged.items():
+        max_risk = data.get("max_risk", 0)
+        max_existing = data.get("max_existing_risk", 0)
+        priority = data.get("priority_score", 0)
+
+        # Same qualification as extract_tasks_from_merged
+        effective_risk = max(max_risk, max_existing)
+        if effective_risk < args.threshold and priority <= 0:
+            continue
+
+        if _is_repo_scanned_this_month(repo):
+            skipped_monthly += 1
+            continue
+
+        has_work = True
+        candidate_count += 1
+        priority_marker = f" priority={priority}" if priority > 0 else ""
+        llm_marker = " [LLM-enriched]" if data.get("llm_scan_instructions") else ""
+        print(f"  ✅ {repo} (new={max_risk}, "
+              f"existing={max_existing}{priority_marker}{llm_marker})")
 
     print(f"\n📋 Precheck summary:")
     print(f"   Qualifying repos:   {candidate_count}")
@@ -618,9 +1052,8 @@ def cmd_precheck(args):
 
     return 0
 
-
 def cmd_prepare(args):
-    """Phase 1: Read pit-boss JSON(s), generate task queue."""
+    """Phase 1: Read pit-boss data, generate task queue."""
     print("=" * 60)
     print("  repo-shakedown — Prepare scan tasks")
     print("=" * 60)
@@ -638,94 +1071,106 @@ def cmd_prepare(args):
     for d in [WORK_DIR, INSTRUCTIONS_DIR, RESULTS_DIR, REPORTS_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # Handle --reprocess: clear tracking so all files are re-ingested
     if args.reprocess:
         if PROCESSED_FILE.exists():
             PROCESSED_FILE.unlink()
         print("  🔄 Reprocess mode — ignoring previous tracking")
 
-    # ── Load pit-boss data from local files or S3 ────────────
-    pitboss_files = []
-
-    if args.pitboss_json:
-        # Local file mode — one or more files
-        paths = args.pitboss_json if isinstance(args.pitboss_json, list) else [args.pitboss_json]
-        print(f"\n📥 Loading from local files ...")
-        pitboss_files = load_pitboss_files_local(paths)
-
-    elif args.s3_prefix:
-        # S3 mode — download all JSONs under prefix
-        print(f"\n📥 Loading from S3: s3://{S3_BUCKET}/{args.s3_prefix}")
-        pitboss_files = load_pitboss_files_from_s3(args.s3_prefix)
-
-    else:
-        print("❌ Provide either --pitboss-json or --s3-prefix")
-        return 1
-
+    # ── Load all pit-boss files (snapshots + candidates) ────
+    pitboss_files = _load_pitboss_files_dual(args)
     if not pitboss_files:
         print("\n⚠️  No new pit-boss files to process.")
         return 0
 
-    # ── Process each file ────────────────────────────────────
+    # Classify what we got for the operator
+    snap_count = sum(
+        1 for pf in pitboss_files
+        if _classify_pitboss_file(pf.get("data", {})) == "snapshot"
+    )
+    cand_count = sum(
+        1 for pf in pitboss_files
+        if _classify_pitboss_file(pf.get("data", {})) == "candidates"
+    )
+    print(f"\n   Loaded: {snap_count} snapshot(s), {cand_count} candidates file(s)")
+
+    # ── Merge per-repo across all sources ───────────────────
+    merged = build_merged_repo_index(pitboss_files)
+    print(f"   Merged index: {len(merged)} unique repos")
+
+    threshold = getattr(args, "threshold", 5)
+    above = sum(
+        1 for v in merged.values()
+        if max(v.get("max_risk", 0), v.get("max_existing_risk", 0)) >= threshold
+        or v.get("priority_score", 0) > 0
+    )
+    enriched = sum(1 for v in merged.values() if v.get("llm_scan_instructions"))
+    print(f"   Above threshold ({threshold}/10) or pit-boss-flagged: {above}")
+    print(f"   With LLM-enriched targeting: {enriched}")
+
+    # ── Build tasks ─────────────────────────────────────────
     existing_tasks = load_tasks()
-    existing_repos = {t["repo"] for t in existing_tasks if t["status"] == "pending"}
-    total_added = 0
+    existing_repos = {t["repo"] for t in existing_tasks
+                      if t["status"] == "pending"}
 
+    new_tasks = extract_tasks_from_merged(
+        merged, repos_dir, auto_clone=auto_clone, threshold=threshold,
+    )
+
+    added = 0
+    skipped_existing = 0
+    skipped_monthly = 0
+
+    for task in new_tasks:
+        if task["repo"] in existing_repos:
+            print(f"  ⏭️  {task['repo']} — already has a pending task")
+            skipped_existing += 1
+            continue
+        if _is_repo_scanned_this_month(task["repo"]):
+            print(f"  ⏭️  {task['repo']} — already scanned this month "
+                  f"({_get_month_key()})")
+            skipped_monthly += 1
+            continue
+
+        # Tag with sources for traceability
+        task["source_keys"] = [
+            pf["source_key"]
+            for pf in pitboss_files
+        ]
+        task["source_names"] = [
+            str(pf.get("s3_key", pf.get("local_path")))
+            for pf in pitboss_files
+        ]
+        existing_tasks.append(task)
+        existing_repos.add(task["repo"])
+        added += 1
+
+        priority_marker = f" priority={task['priority_score']}" \
+            if task.get("priority_score", 0) > 0 else ""
+        llm_marker = " [LLM-enriched]" if task.get("has_llm_enrichment") else ""
+        print(f"  ✅ {task['repo']} "
+              f"(risk={task['max_risk']}{priority_marker}{llm_marker})")
+
+    # Mark all sources as processed
     for pf in pitboss_files:
-        data = pf["data"]
-        source_key = pf["source_key"]
-        source_name = pf.get("s3_key", pf["local_path"])
-
-        threshold = getattr(args, "threshold", 5)
-        repo_risk = data.get("repo_risk", {})
-        above = sum(
-            1 for v in repo_risk.values()
-            if max(v.get("max_risk", 0), v.get("max_existing_risk", 0)) >= threshold
-        )
-        print(f"\n📄 Processing: {source_name}")
-        print(f"   Repos in snapshot: {len(repo_risk)}, "
-              f"Above threshold ({threshold}/10): {above}")
-
-        new_tasks = extract_tasks_from_pitboss(data, repos_dir, auto_clone=auto_clone,
-                                               threshold=threshold)
-        added = 0
-        for task in new_tasks:
-            if task["repo"] in existing_repos:
-                print(f"  ⏭️  {task['repo']} — already has a pending task")
-                continue
-            if _is_repo_scanned_this_month(task["repo"]):
-                print(f"  ⏭️  {task['repo']} — already scanned this month ({_get_month_key()})")
-                continue
-            # Tag task with its source for traceability
-            task["source_key"] = source_key
-            task["source_name"] = str(source_name)
-            existing_tasks.append(task)
-            existing_repos.add(task["repo"])
-            added += 1
-            print(f"  ✅ {task['repo']} (risk={task['max_risk']})")
-
-        # Mark this source as processed
-        mark_source_processed(source_key)
-        total_added += added
-        print(f"   → {added} tasks from this file")
+        mark_source_processed(pf["source_key"])
 
     save_tasks(existing_tasks)
 
     pending = sum(1 for t in existing_tasks if t["status"] == "pending")
     processed = load_processed_sources()
     print(f"\n📋 Summary:")
-    print(f"   New tasks added:    {total_added}")
+    print(f"   New tasks added:    {added}")
+    print(f"   Skipped (pending):  {skipped_existing}")
+    print(f"   Skipped (monthly):  {skipped_monthly}")
     print(f"   Total pending:      {pending}")
     print(f"   Sources processed:  {len(processed)} (lifetime)")
     print(f"   Queue file:         {TASKS_FILE}")
-    print(f"   Tracking file:      {PROCESSED_FILE}")
 
     print(f"\n{'=' * 60}")
     print(f"  Run `python repo_shakedown.py scan` to scan one task.")
     print(f"  Run `python repo_shakedown.py run ...` to scan all tasks.")
     print(f"{'=' * 60}")
     return 0
-
 
 # ── Phase 2: Scan ────────────────────────────────────────────────
 
@@ -1444,6 +1889,26 @@ def cmd_run(args):
     return 0 if failed == 0 else 1
 
 
+def _validate_source_args(args) -> Optional[str]:
+    """
+    Ensure at least one source flag was provided. Returns an error message
+    (str) on failure, None on success.
+    """
+    if args.command in ("run-one", "run", "prepare", "precheck"):
+        has_source = (
+            getattr(args, "pitboss_json", None)
+            or getattr(args, "s3_prefix", None)
+            or getattr(args, "snapshots_prefix", None)
+            or getattr(args, "candidates_prefix", None)
+        )
+        if not has_source:
+            return (
+                "No pit-boss source provided. Pass at least one of: "
+                "--pitboss-json, --s3-prefix, --snapshots-prefix, "
+                "--candidates-prefix"
+            )
+    return None
+
 # ── CLI ──────────────────────────────────────────────────────────
 
 def main():
@@ -1478,11 +1943,6 @@ def main():
         "run-one",
         help="CI mode: prepare + scan one repo + report (monthly dedup applied)",
     )
-    run_one_source = run_one_p.add_mutually_exclusive_group(required=True)
-    run_one_source.add_argument("--pitboss-json", nargs="+",
-                                help="Path(s) to local candidates.json file(s)")
-    run_one_source.add_argument("--s3-prefix", type=str,
-                                help="S3 prefix for candidates.json files")
     run_one_p.add_argument("--repos-dir", required=True,
                            help="Directory to store cloned repositories")
     run_one_p.add_argument("--auto-clone", action="store_true",
@@ -1491,16 +1951,37 @@ def main():
                            help="Ignore tracking — reprocess all files")
     run_one_p.add_argument("--threshold", type=int, default=5,
                            help="Min max_risk score to include a repo (default: 5)")
+    run_one_p.add_argument(
+        "--pitboss-json", nargs="+",
+        help="Path(s) to local pit-boss JSON file(s) — "
+            "either snapshots or candidates.json. Auto-detected by structure.",
+    )
+    run_one_p.add_argument(
+        "--s3-prefix", type=str,
+        help="[Legacy] Single S3 prefix for pit-boss files. "
+            "Prefer --snapshots-prefix and/or --candidates-prefix.",
+    )
+    run_one_p.add_argument(
+        "--snapshots-prefix", type=str,
+        help="S3 prefix for pit-boss snapshot files "
+            "(e.g. pitboss-snapshots/2026-04/). Combined with --candidates-prefix "
+            "for richer scan instructions.",
+    )
+    run_one_p.add_argument(
+        "--candidates-prefix", type=str,
+        help="S3 prefix for pit-boss candidates.json files "
+            "(e.g. shakedown/). Combined with --snapshots-prefix.",
+    )
+    run_one_p.add_argument(
+        "--month", type=str,
+        help="Filter ingested files to this month label "
+            "(YYYY-MM). Useful when --candidates-prefix points at the parent "
+            "shakedown/ folder containing many weeks.",
+    )
 
     # ── run: all-in-one for local use ──────────────────────────
     run_p = sub.add_parser("run",
                            help="All-in-one: prepare + clone + scan all + report")
-    run_source = run_p.add_mutually_exclusive_group(required=True)
-    run_source.add_argument("--pitboss-json", nargs="+",
-                            help="Path(s) to local candidates.json file(s)")
-    run_source.add_argument("--s3-prefix", type=str,
-                            help="S3 prefix for candidates.json files "
-                                 "(e.g. shakedown/2026-04-d01-07/)")
     run_p.add_argument("--repos-dir", required=True,
                        help="Directory to store cloned repositories")
     run_p.add_argument("--auto-clone", action="store_true",
@@ -1509,15 +1990,37 @@ def main():
                        help="Ignore tracking — reprocess all files")
     run_p.add_argument("--threshold", type=int, default=5,
                        help="Min max_risk score to include a repo (default: 5)")
+    run_p.add_argument(
+        "--pitboss-json", nargs="+",
+        help="Path(s) to local pit-boss JSON file(s) — "
+            "either snapshots or candidates.json. Auto-detected by structure.",
+    )
+    run_p.add_argument(
+        "--s3-prefix", type=str,
+        help="[Legacy] Single S3 prefix for pit-boss files. "
+            "Prefer --snapshots-prefix and/or --candidates-prefix.",
+    )
+    run_p.add_argument(
+        "--snapshots-prefix", type=str,
+        help="S3 prefix for pit-boss snapshot files "
+            "(e.g. pitboss-snapshots/2026-04/). Combined with --candidates-prefix "
+            "for richer scan instructions.",
+    )
+    run_p.add_argument(
+        "--candidates-prefix", type=str,
+        help="S3 prefix for pit-boss candidates.json files "
+            "(e.g. shakedown/). Combined with --snapshots-prefix.",
+    )
+    run_p.add_argument(
+        "--month", type=str,
+        help="Filter ingested files to this month label "
+            "(YYYY-MM). Useful when --candidates-prefix points at the parent "
+            "shakedown/ folder containing many weeks.",
+    )
+
 
     # ── prepare: build task queue only ─────────────────────────
     prep = sub.add_parser("prepare", help="Build scan tasks from candidates.json")
-    prep_source = prep.add_mutually_exclusive_group(required=True)
-    prep_source.add_argument("--pitboss-json", nargs="+",
-                             help="Path(s) to local candidates.json file(s)")
-    prep_source.add_argument("--s3-prefix", type=str,
-                             help="S3 prefix for candidates.json files "
-                                  "(e.g. shakedown/2026-04-d01-07/)")
     prep.add_argument("--repos-dir", required=True,
                       help="Directory containing cloned repositories")
     prep.add_argument("--auto-clone", action="store_true",
@@ -1526,6 +2029,34 @@ def main():
                       help="Ignore tracking — reprocess all files")
     prep.add_argument("--threshold", type=int, default=5,
                       help="Min max_risk score to include a repo (default: 5)")
+    prep.add_argument(
+        "--pitboss-json", nargs="+",
+        help="Path(s) to local pit-boss JSON file(s) — "
+            "either snapshots or candidates.json. Auto-detected by structure.",
+    )
+    prep.add_argument(
+        "--s3-prefix", type=str,
+        help="[Legacy] Single S3 prefix for pit-boss files. "
+            "Prefer --snapshots-prefix and/or --candidates-prefix.",
+    )
+    prep.add_argument(
+        "--snapshots-prefix", type=str,
+        help="S3 prefix for pit-boss snapshot files "
+            "(e.g. pitboss-snapshots/2026-04/). Combined with --candidates-prefix "
+            "for richer scan instructions.",
+    )
+    prep.add_argument(
+        "--candidates-prefix", type=str,
+        help="S3 prefix for pit-boss candidates.json files "
+            "(e.g. shakedown/). Combined with --snapshots-prefix.",
+    )
+    prep.add_argument(
+        "--month", type=str,
+        help="Filter ingested files to this month label "
+            "(YYYY-MM). Useful when --candidates-prefix points at the parent "
+            "shakedown/ folder containing many weeks.",
+    )
+
 
     # ── scan, report, status ────────────────────────────────────
     scan = sub.add_parser("scan", help="Run next pending scan")
@@ -1534,18 +2065,45 @@ def main():
 
     precheck_p = sub.add_parser("precheck",
         help="Read-only: check whether any repo qualifies for scanning")
-    precheck_source = precheck_p.add_mutually_exclusive_group(required=True)
-    precheck_source.add_argument("--pitboss-json", nargs="+",
-        help="Path(s) to local candidates.json file(s)")
-    precheck_source.add_argument("--s3-prefix", type=str,
-        help="S3 prefix for candidates.json files")
     precheck_p.add_argument("--threshold", type=int, default=5,
         help="Min max(new, existing) risk score (default: 5)")
+    precheck_p.add_argument(
+        "--pitboss-json", nargs="+",
+        help="Path(s) to local pit-boss JSON file(s) — "
+            "either snapshots or candidates.json. Auto-detected by structure.",
+    )
+    precheck_p.add_argument(
+        "--s3-prefix", type=str,
+        help="[Legacy] Single S3 prefix for pit-boss files. "
+            "Prefer --snapshots-prefix and/or --candidates-prefix.",
+    )
+    precheck_p.add_argument(
+        "--snapshots-prefix", type=str,
+        help="S3 prefix for pit-boss snapshot files "
+            "(e.g. pitboss-snapshots/2026-04/). Combined with --candidates-prefix "
+            "for richer scan instructions.",
+    )
+    precheck_p.add_argument(
+        "--candidates-prefix", type=str,
+        help="S3 prefix for pit-boss candidates.json files "
+            "(e.g. shakedown/). Combined with --snapshots-prefix.",
+    )
+    precheck_p.add_argument(
+        "--month", type=str,
+        help="Filter ingested files to this month label "
+            "(YYYY-MM). Useful when --candidates-prefix points at the parent "
+            "shakedown/ folder containing many weeks.",
+    )
+
 
     sub.add_parser("report", help="Generate reports for completed scans")
     sub.add_parser("status", help="Show queue status")
 
     args = p.parse_args()
+    err = _validate_source_args(args)
+    if err:
+        print(f"❌ {err}")
+        return 1
 
     if args.command == "run-one":
         return cmd_run_one(args)
