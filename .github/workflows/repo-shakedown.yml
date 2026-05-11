@@ -17,7 +17,25 @@ on:
   workflow_call:
     inputs:
       pitboss_s3_prefix:
-        description: 'S3 prefix for pit-boss data (auto-detects pitboss-snapshots/YYYY-MM/ if blank)'
+        description: |
+          [Legacy] Single S3 prefix for pit-boss data. Prefer the dual-prefix
+          inputs below. If set, only this prefix is read (no merge with
+          candidates).
+        required: false
+        type: string
+        default: ''
+      pitboss_snapshots_prefix:
+        description: |
+          S3 prefix for pit-boss snapshot files (PR-level granularity).
+          If blank (default), auto-detects pitboss-snapshots/YYYY-MM/.
+        required: false
+        type: string
+        default: ''
+      pitboss_candidates_prefix:
+        description: |
+          S3 prefix for pit-boss candidates.json files (LLM-enriched targeting).
+          If blank (default), auto-detects shakedown/.
+          Combined with snapshots for richer scan instructions.
         required: false
         type: string
         default: ''
@@ -124,21 +142,36 @@ jobs:
           S3_BUCKET:             ${{ inputs.s3_bucket }}
           S3_REPORTS_PREFIX:     ${{ inputs.s3_reports_prefix }}
         run: |
+          YEAR_MONTH=$(date +%Y-%m)
+
+          # Build source flags. Three modes:
+          #   1. Legacy single prefix (pitboss_s3_prefix set) — use it alone
+          #   2. Dual prefixes (one or both of *_snapshots_prefix /
+          #      *_candidates_prefix set) — use whichever is set
+          #   3. Default — auto-detect both prefixes for the current month
           if [ -n "${{ inputs.pitboss_s3_prefix }}" ]; then
-            SOURCE_PREFIX="${{ inputs.pitboss_s3_prefix }}"
+            SOURCE_FLAGS="--s3-prefix ${{ inputs.pitboss_s3_prefix }}"
           else
-            SOURCE_PREFIX="pitboss-snapshots/$(date +%Y-%m)/"
+            SNAPSHOTS_PREFIX="${{ inputs.pitboss_snapshots_prefix }}"
+            CANDIDATES_PREFIX="${{ inputs.pitboss_candidates_prefix }}"
+            if [ -z "$SNAPSHOTS_PREFIX" ]; then
+              SNAPSHOTS_PREFIX="pitboss-snapshots/${YEAR_MONTH}/"
+            fi
+            if [ -z "$CANDIDATES_PREFIX" ]; then
+              CANDIDATES_PREFIX="shakedown/"
+            fi
+            SOURCE_FLAGS="--snapshots-prefix $SNAPSHOTS_PREFIX --candidates-prefix $CANDIDATES_PREFIX --month $YEAR_MONTH"
           fi
 
           python .repo-shakedown/repo_shakedown.py precheck \
-            --s3-prefix "$SOURCE_PREFIX" \
+            $SOURCE_FLAGS \
             --threshold "${{ inputs.shakedown_threshold }}"
 
   shakedown:
     needs: precheck
     if: needs.precheck.outputs.has_work == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 420   # 7 hours — enough for "deep" scan mode (6h) + setup
 
     steps:
       - name: Checkout repo-shakedown scripts
@@ -188,12 +221,21 @@ jobs:
           JIRA_EMAIL:            ${{ inputs.enable_jira && secrets.JIRA_EMAIL || '' }}
           JIRA_API_TOKEN:        ${{ inputs.enable_jira && secrets.JIRA_API_TOKEN || '' }}
         run: |
+          YEAR_MONTH=$(date +%Y-%m)
+
+          # Same source-flag logic as precheck — keep them in sync.
           if [ -n "${{ inputs.pitboss_s3_prefix }}" ]; then
-            SOURCE="--s3-prefix ${{ inputs.pitboss_s3_prefix }}"
+            SOURCE_FLAGS="--s3-prefix ${{ inputs.pitboss_s3_prefix }}"
           else
-            YEAR=$(date +%Y)
-            MONTH=$(date +%m)
-            SOURCE="--s3-prefix pitboss-snapshots/${YEAR}-${MONTH}/"
+            SNAPSHOTS_PREFIX="${{ inputs.pitboss_snapshots_prefix }}"
+            CANDIDATES_PREFIX="${{ inputs.pitboss_candidates_prefix }}"
+            if [ -z "$SNAPSHOTS_PREFIX" ]; then
+              SNAPSHOTS_PREFIX="pitboss-snapshots/${YEAR_MONTH}/"
+            fi
+            if [ -z "$CANDIDATES_PREFIX" ]; then
+              CANDIDATES_PREFIX="shakedown/"
+            fi
+            SOURCE_FLAGS="--snapshots-prefix $SNAPSHOTS_PREFIX --candidates-prefix $CANDIDATES_PREFIX --month $YEAR_MONTH"
           fi
 
           REPROCESS_FLAG=""
@@ -202,7 +244,7 @@ jobs:
           python .repo-shakedown/repo_shakedown.py \
             --llm "${{ inputs.llm }}" \
             run-one \
-            $SOURCE \
+            $SOURCE_FLAGS \
             --repos-dir "./repos" \
             --auto-clone \
             --threshold "${{ inputs.shakedown_threshold }}" \
@@ -216,6 +258,7 @@ jobs:
           path: |
             ./shakedown-work/reports/
             ./shakedown-work/results/
+            ./shakedown-work/instructions/
             ./shakedown-work/tasks.json
           retention-days: 90
           if-no-files-found: ignore
