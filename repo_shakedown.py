@@ -849,91 +849,373 @@ def extract_tasks_from_merged(
 
     return tasks
 
-def generate_instruction_file(repo: str, repo_entry: Dict) -> str:
+
+def generate_instruction_file(repo: str, data: Dict) -> str:
     """
-    Generate a focused Strix instruction file from pit-boss repo_risk data.
+    Build a layered Strix instruction file from merged pit-boss data.
+
+    Tier A (richest): LLM-enriched targeting present.
+        Uses llm_scan_instructions, llm_priority_files, llm_focus_areas,
+        llm_existing_debt_notes, llm_risk_if_ignored as the primary content.
+    Tier B (medium): scan_guidance from candidates.json present, no LLM.
+        Uses priority_files, critical_issue_titles, existing_ai_issues.
+    Tier C (basic): only snapshot-level data or threshold-only qualification.
+        Generic scope with risk numbers and any top_issues lists.
+
+    All tiers include the same testing methodology section at the end so
+    Strix gets consistent output expectations regardless of input quality.
     """
-    lines = []
+    lines: List[Dict] = []  # Will use append; type hint loose for clarity
 
-    max_risk = repo_entry.get("max_risk", 0)
-    max_existing = repo_entry.get("max_existing_risk", 0)
-    total_prs = repo_entry.get("total_prs", 0)
-    new_critical = repo_entry.get("new_critical_count", 0)
+    # ── Header + urgency ────────────────────────────────────
+    urgency = data.get("llm_urgency") or _infer_urgency(data)
+    scan_mode = data.get("suggested_scan_mode", "default")
 
-    lines.append(f"# Penetration Test Instructions — {repo}")
+    lines.append(f"# Penetration Test Scope: {repo}")
     lines.append("")
-    lines.append("## Risk Summary")
-    lines.append("")
-    lines.append(f"- Max new risk score: {max_risk}/10")
-    lines.append(f"- Max existing risk score: {max_existing}/10")
-    lines.append(f"- New critical issues: {new_critical}")
-    lines.append(f"- PRs reviewed: {total_prs}")
+    lines.append(f"**Urgency:** {urgency}  ")
+    lines.append(f"**Suggested scan mode:** {scan_mode}  ")
+    if data.get("priority_score"):
+        lines.append(f"**Priority score:** {data['priority_score']}  ")
     lines.append("")
 
-    # Recent new issues flagged during PR reviews
-    top_new = repo_entry.get("top_new_issues", [])
-    if top_new:
-        lines.append("## Recent New Issues (from PR reviews)")
-        lines.append("")
-        lines.append("These vulnerabilities were introduced in recent PRs — investigate further:")
-        lines.append("")
-        for issue in top_new:
-            title = issue.get("title", issue) if isinstance(issue, dict) else issue
-            severity = issue.get("severity", "") if isinstance(issue, dict) else ""
-            lines.append(f"- {title}" + (f" ({severity})" if severity else ""))
-        lines.append("")
+    # ── Risk context (always present) ───────────────────────
+    lines.append("## Risk Context")
+    lines.append("")
+    lines.append(f"- Max NEW risk score: {data.get('max_risk', 0)}/10")
+    lines.append(f"- Max EXISTING risk score: "
+                 f"{data.get('max_existing_risk', 0)}/10")
+    lines.append(f"- NEW critical issues: {data.get('new_critical_count', 0)}")
+    lines.append(f"- EXISTING critical issues: "
+                 f"{data.get('existing_critical_count', 0)}")
+    lines.append(f"- PRs reviewed: {data.get('total_prs', 0)} "
+                 f"({data.get('total_scans', data.get('total_prs', 0))} scans)")
+    if data.get("override_count", 0) > 0:
+        lines.append(f"- Overrides applied: {data['override_count']}")
+    if data.get("fix_count", 0) > 0:
+        lines.append(f"- Issues fixed during PR cycle: {data['fix_count']}")
+    if data.get("persist_count", 0) > 0:
+        lines.append(f"- Issues that persisted unfixed: {data['persist_count']}")
+    lines.append("")
 
-    # Existing issues
-    top_existing = repo_entry.get("top_existing_issues", [])
-    if top_existing:
-        lines.append("## Known Existing Issues")
-        lines.append("")
-        lines.append("These issues were already present — confirm they are still unresolved:")
-        lines.append("")
-        for issue in top_existing:
-            title = issue.get("title", issue) if isinstance(issue, dict) else issue
-            severity = issue.get("severity", "") if isinstance(issue, dict) else ""
-            lines.append(f"- {title}" + (f" ({severity})" if severity else ""))
-        lines.append("")
-
-    # Existing code issues with file info
-    existing_code = repo_entry.get("existing_code_issues", [])
-    if existing_code:
-        lines.append("## Existing Code Issues")
-        lines.append("")
-        lines.append("| File | Title | Severity |")
-        lines.append("|------|-------|----------|")
-        for issue in existing_code:
-            f = issue.get("file", "unknown") if isinstance(issue, dict) else "unknown"
-            title = issue.get("title", "") if isinstance(issue, dict) else str(issue)
-            severity = issue.get("severity", "") if isinstance(issue, dict) else ""
-            lines.append(f"| `{f}` | {title} | {severity} |")
-        lines.append("")
-
-    # Recommendations from pit-boss
-    recommendations = repo_entry.get("recommendations", [])
-    if recommendations:
-        lines.append("## Recommendations")
-        lines.append("")
-        for r in recommendations:
+    reasons = data.get("reasons") or []
+    if reasons:
+        lines.append("**Why this repo was flagged:**")
+        for r in reasons:
             lines.append(f"- {r}")
         lines.append("")
 
-    # General instructions
-    lines.append("## General Instructions")
+    # ── Tier A: LLM threat assessment ───────────────────────
+    if data.get("llm_narrative"):
+        lines.append("## Threat Assessment")
+        lines.append("")
+        lines.append(data["llm_narrative"])
+        lines.append("")
+
+    # ── Tier A: specific scan instructions from the LLM ─────
+    if data.get("llm_scan_instructions"):
+        lines.append("## Specific Scan Instructions")
+        lines.append("")
+        lines.append("> The following targeting was generated by analyzing "
+                     "PR-Bouncer review data. Treat as authoritative scope "
+                     "guidance.")
+        lines.append("")
+        lines.append(data["llm_scan_instructions"])
+        lines.append("")
+
+    # ── Priority files (combine LLM + scan_guidance) ────────
+    priority_files = []
+    seen_files = set()
+    for f in (data.get("llm_priority_files") or []):
+        if f and f not in seen_files:
+            priority_files.append(f)
+            seen_files.add(f)
+    for f in (data.get("scan_guidance") or {}).get("priority_files", []):
+        if f and f not in seen_files:
+            priority_files.append(f)
+            seen_files.add(f)
+
+    if priority_files:
+        lines.append("## Priority Files — Examine These First")
+        lines.append("")
+        for f in priority_files:
+            lines.append(f"- `{f}`")
+        lines.append("")
+
+    # ── Focus areas / vulnerability classes ─────────────────
+    focus_areas = data.get("llm_focus_areas") or []
+    if focus_areas:
+        lines.append("## Focus Areas")
+        lines.append("")
+        lines.append("Concentrate on the following vulnerability classes "
+                     "in the priority files above:")
+        lines.append("")
+        for fa in focus_areas:
+            lines.append(f"- {fa}")
+        lines.append("")
+
+    # ── Tier B: critical issues already flagged ─────────────
+    crit_titles = data.get("critical_issue_titles") or []
+    if crit_titles:
+        lines.append("## Critical Issues Already Flagged — Verify Exploitability")
+        lines.append("")
+        lines.append("These were flagged during PR review. Confirm whether "
+                     "they are reachable and exploitable in production code paths:")
+        lines.append("")
+        for t in crit_titles:
+            lines.append(f"- {t}")
+        lines.append("")
+
+    # ── Tier B: AI-found existing code issues ───────────────
+    existing_ai = (data.get("scan_guidance") or {}).get("existing_ai_issues", [])
+    if existing_ai:
+        lines.append("## Pre-Existing Issues (AI-detected, automated tools missed)")
+        lines.append("")
+        lines.append("| File | Issue | Severity |")
+        lines.append("|------|-------|----------|")
+        for issue in existing_ai:
+            f_path = issue.get("file", "?")
+            title = (issue.get("title", "?")
+                     .replace("|", "\\|")
+                     .replace("\n", " "))
+            severity = issue.get("severity", "?")
+            lines.append(f"| `{f_path}` | {title} | {severity} |")
+        lines.append("")
+
+    # ── Tier B/C: existing code issues from snapshot ────────
+    snapshot_existing = data.get("existing_code_issues") or []
+    # Dedupe vs scan_guidance.existing_ai_issues by file+title
+    seen_keys = {
+        (i.get("file", ""), i.get("title", ""))
+        for i in existing_ai
+    }
+    snapshot_existing_unique = [
+        i for i in snapshot_existing
+        if isinstance(i, dict)
+        and (i.get("file", ""), i.get("title", "")) not in seen_keys
+    ]
+    if snapshot_existing_unique:
+        lines.append("## Additional Pre-Existing Issues (from PR scans)")
+        lines.append("")
+        lines.append("| File | Issue | Severity |")
+        lines.append("|------|-------|----------|")
+        for issue in snapshot_existing_unique[:15]:
+            f_path = issue.get("file", "?")
+            title = (issue.get("title", "?")
+                     .replace("|", "\\|").replace("\n", " "))
+            severity = issue.get("severity", "?")
+            lines.append(f"| `{f_path}` | {title} | {severity} |")
+        lines.append("")
+
+    # ── Tier B/C: top issue patterns from snapshot ──────────
+    top_new = data.get("top_new_issues") or []
+    if top_new:
+        lines.append("## Recently Introduced Issue Patterns (from PR scans)")
+        lines.append("")
+        lines.append("Issue types appearing in NEW code across recent PRs:")
+        lines.append("")
+        for issue in top_new[:10]:
+            if isinstance(issue, (list, tuple)) and len(issue) >= 2:
+                rule, count = issue[0], issue[1]
+                lines.append(f"- `{rule}` (appeared {count}x)")
+            elif isinstance(issue, dict):
+                rule = issue.get("rule") or issue.get("title", "?")
+                lines.append(f"- {rule}")
+            else:
+                lines.append(f"- {issue}")
+        lines.append("")
+
+    top_existing = data.get("top_existing_issues") or []
+    if top_existing:
+        lines.append("## Pre-Existing Issue Patterns (technical debt)")
+        lines.append("")
+        lines.append("Issue types in EXISTING code — verify exploitability "
+                     "of the most common ones:")
+        lines.append("")
+        for issue in top_existing[:10]:
+            if isinstance(issue, (list, tuple)) and len(issue) >= 2:
+                rule, count = issue[0], issue[1]
+                lines.append(f"- `{rule}` (appeared {count}x)")
+            elif isinstance(issue, dict):
+                rule = issue.get("rule") or issue.get("title", "?")
+                lines.append(f"- {rule}")
+            else:
+                lines.append(f"- {issue}")
+        lines.append("")
+
+    # ── Tier B: focus_rules from scan_guidance ──────────────
+    focus_rules = (data.get("scan_guidance") or {}).get("focus_rules", [])
+    if focus_rules:
+        lines.append("## Specific Tool-Detected Patterns")
+        lines.append("")
+        lines.append("Static analysis already flagged these rule IDs — "
+                     "verify which are real vulnerabilities:")
+        lines.append("")
+        for rule_entry in focus_rules[:10]:
+            if isinstance(rule_entry, (list, tuple)) and len(rule_entry) >= 2:
+                rule, count = rule_entry[0], rule_entry[1]
+                lines.append(f"- `{rule}` (fired {count}x)")
+            else:
+                lines.append(f"- `{rule_entry}`")
+        lines.append("")
+
+    # ── Tier A: LLM existing debt notes ─────────────────────
+    if data.get("llm_existing_debt_notes"):
+        lines.append("## Pre-Existing Security Debt — Context")
+        lines.append("")
+        lines.append(data["llm_existing_debt_notes"])
+        lines.append("")
+
+    # ── Tier A: LLM risk-if-ignored ─────────────────────────
+    if data.get("llm_risk_if_ignored"):
+        lines.append("## Impact if Vulnerabilities Are Exploited")
+        lines.append("")
+        lines.append(data["llm_risk_if_ignored"])
+        lines.append("")
+
+    # ── Snapshot-level: PR activity ─────────────────────────
+    pr_records = data.get("pr_records") or []
+    if pr_records:
+        lines.append("## Recent PR Activity")
+        lines.append("")
+        lines.append("PRs that contributed to the risk assessment:")
+        lines.append("")
+        lines.append("| PR | Risk (new/exist) | Crits (new/exist) "
+                     "| Trend | Overridden |")
+        lines.append("|----|------------------|-------------------"
+                     "|-------|------------|")
+        for p in pr_records[:10]:
+            if not isinstance(p, dict):
+                continue
+            trend = p.get("trend") or "—"
+            overridden = "yes" if p.get("was_overridden") else "no"
+            lines.append(
+                f"| #{p.get('pr_number', '?')} "
+                f"| {p.get('risk_score', 0)}/{p.get('existing_risk_score', 0)} "
+                f"| {p.get('new_critical_count', 0)}/"
+                f"{p.get('existing_critical_count', 0)} "
+                f"| {trend} "
+                f"| {overridden} |"
+            )
+        lines.append("")
+
+        # Issues that persisted across re-scans — strong scan target
+        all_persisted = []
+        for p in pr_records:
+            if isinstance(p, dict):
+                all_persisted.extend(p.get("issues_persisted", []))
+        all_persisted = list(dict.fromkeys(all_persisted))  # dedupe
+        if all_persisted:
+            lines.append("### Issues That Persisted Across Re-Scans")
+            lines.append("")
+            lines.append("Developers were unable or unwilling to fix these. "
+                         "They are strong candidates for exploitation testing:")
+            lines.append("")
+            for issue in all_persisted[:10]:
+                lines.append(f"- `{issue}`")
+            lines.append("")
+
+    # ── Snapshot-level: recommendations ─────────────────────
+    recommendations = data.get("recommendations") or []
+    if recommendations:
+        lines.append("## Recommendations from PR Reviews")
+        lines.append("")
+        lines.append("Items the reviewing AI suggested addressing:")
+        lines.append("")
+        for r in recommendations[:10]:
+            if isinstance(r, dict):
+                rec_text = r.get("recommendation") or r.get("title") or str(r)
+                pr_num = r.get("pr", "")
+                pr_marker = f" (PR #{pr_num})" if pr_num else ""
+                lines.append(f"- {rec_text}{pr_marker}")
+            else:
+                lines.append(f"- {r}")
+        lines.append("")
+
+    # ── Tier marker for transparency ────────────────────────
+    tier = _determine_tier(data)
+    lines.append(f"_Scope tier: **{tier}** — "
+                 f"{'rich AI-enriched targeting' if tier == 'A' else ''}"
+                 f"{'deterministic targeting from review tools' if tier == 'B' else ''}"
+                 f"{'risk-score qualification only — no specific targeting' if tier == 'C' else ''}_")
     lines.append("")
-    lines.append("- This is a source-code review scan. The repository is cloned locally.")
-    lines.append("- Focus on finding exploitable vulnerabilities, not cosmetic issues.")
-    lines.append("- For each finding, describe a realistic attack scenario.")
-    lines.append("- Prioritize findings that could lead to data breach, privilege "
-                 "escalation, or service disruption.")
-    lines.append("- If you find a vulnerability, attempt to create a proof-of-concept.")
-    lines.append("- Rate each finding: CRITICAL, HIGH, MEDIUM, LOW.")
-    lines.append("- Note any security controls that are well-implemented "
-                 "('good catches' for the team).")
+
+    # ── Testing methodology (always identical, always last) ──
+    lines.append("## Testing Methodology")
+    lines.append("")
+    lines.append("This is a source-code-level penetration test against a "
+                 "locally cloned repository.")
+    lines.append("")
+    lines.append("### Approach")
+    lines.append("")
+    lines.append("1. **Read the priority files end-to-end** before running "
+                 "any tests. Understand the data flow.")
+    lines.append("2. **Identify entry points** for each focus area: where "
+                 "untrusted input enters the application.")
+    lines.append("3. **Trace input through to sinks** — where it affects "
+                 "state, output, or external systems.")
+    lines.append("4. **For each suspected vulnerability**, attempt to "
+                 "construct a working proof-of-concept.")
+    lines.append("5. **Verify pre-flagged criticals** — confirm whether each "
+                 "is actually exploitable, not just theoretical.")
+    lines.append("6. **Check for variants** — once you find one instance of "
+                 "a vulnerability class, scan for similar patterns.")
+    lines.append("")
+    lines.append("### Each finding must include")
+    lines.append("")
+    lines.append("- The **vulnerability class** (e.g., SQL injection, prompt "
+                 "injection, IDOR, path traversal)")
+    lines.append("- **Affected file(s) and line number(s)**")
+    lines.append("- A **concrete attack scenario** describing how an external "
+                 "attacker would exploit this — who, how, and what they gain")
+    lines.append("- A **proof-of-concept** payload, request, or code snippet "
+                 "where possible")
+    lines.append("- **Severity rating**: CRITICAL, HIGH, MEDIUM, or LOW")
+    lines.append("- Whether **existing security controls** (authentication, "
+                 "input validation, output encoding, rate limiting) mitigate it")
+    lines.append("")
+    lines.append("### Out of scope")
+    lines.append("")
+    lines.append("- Cosmetic code quality issues without security impact")
+    lines.append("- Theoretical vulnerabilities without a realistic "
+                 "exploitation path")
+    lines.append("- Best-practice recommendations unrelated to the focus "
+                 "areas above")
+    lines.append("- Dependencies and third-party libraries (focus on "
+                 "first-party code)")
+    lines.append("")
+    lines.append("### Note 'good catches'")
+    lines.append("")
+    lines.append("If you encounter security controls that are correctly "
+                 "implemented, mention them. This gives the team positive "
+                 "feedback alongside findings and helps them understand which "
+                 "patterns to replicate.")
 
     return "\n".join(lines)
 
+
+def _infer_urgency(data: Dict) -> str:
+    """Fallback urgency calculation when LLM didn't run."""
+    max_risk = data.get("max_risk", 0)
+    max_existing = data.get("max_existing_risk", 0)
+    crits = (data.get("new_critical_count", 0)
+             + data.get("existing_critical_count", 0))
+    if max_risk >= 9 or crits >= 5:
+        return "CRITICAL"
+    if max_risk >= 7 or max_existing >= 9 or crits >= 2:
+        return "HIGH"
+    return "MEDIUM"
+
+
+def _determine_tier(data: Dict) -> str:
+    """Classify the scope quality for transparency in the instruction file."""
+    if data.get("llm_scan_instructions"):
+        return "A"
+    if (data.get("scan_guidance", {}).get("priority_files")
+            or data.get("critical_issue_titles")
+            or data.get("scan_guidance", {}).get("existing_ai_issues")):
+        return "B"
+    return "C"
 
 def _load_pitboss_files_dual(args) -> List[Dict]:
     """
@@ -1174,17 +1456,49 @@ def cmd_prepare(args):
 
 # ── Phase 2: Scan ────────────────────────────────────────────────
 
+# Mapping from pit-boss scan mode to Strix invocation parameters
+SCAN_MODE_CONFIG = {
+    "quick": {
+        "strix_mode": "quick",
+        "reasoning_effort": "medium",
+        "timeout_seconds": 3600,    # 1 hour
+        "description": "fast scan, medium reasoning",
+    },
+    "default": {
+        "strix_mode": "standard",
+        "reasoning_effort": "high",
+        "timeout_seconds": 14400,   # 4 hours
+        "description": "standard scan, high reasoning",
+    },
+    "deep": {
+        "strix_mode": "deep",
+        "reasoning_effort": "high",
+        "timeout_seconds": 21600,   # 6 hours
+        "description": "deep scan, high reasoning",
+    },
+}
+
+
 def run_strix(task: Dict, llm_model: str) -> int:
     """
     Invoke Strix CLI in headless mode.
-    Returns exit code: 0 = clean, 2 = vulns found.
+
+    Reads task["suggested_scan_mode"] (set by pit-boss via PR1) to vary
+    scan depth, reasoning effort, and timeout. Tasks without that field
+    default to "default" mode for backward compatibility.
+
+    Returns exit code: 0 = clean, 2 = vulns found, other = failure.
     """
     repo_path = task["repo_path"]
     instruction_file = task["instruction_file"]
+    scan_mode = task.get("suggested_scan_mode") or "default"
+
+    # Look up config; fall back to default if pit-boss returned an unknown mode
+    config = SCAN_MODE_CONFIG.get(scan_mode, SCAN_MODE_CONFIG["default"])
 
     env = os.environ.copy()
     env["STRIX_LLM"] = llm_model
-    env["STRIX_REASONING_EFFORT"] = "high"
+    env["STRIX_REASONING_EFFORT"] = config["reasoning_effort"]
 
     # Set the right API key env var for the provider
     api_key = resolve_api_key(llm_model)
@@ -1196,30 +1510,37 @@ def run_strix(task: Dict, llm_model: str) -> int:
         "-n",
         "--target", repo_path,
         "--instruction-file", instruction_file,
-        "--scan-mode", "standard",
+        "--scan-mode", config["strix_mode"],
     ]
 
     print(f"\n🔍 Running Strix:")
-    print(f"   Command:  {' '.join(cmd)}")
-    print(f"   Target:   {repo_path}")
-    print(f"   Effort:   high")
-    print(f"   LLM:      {llm_model}")
+    print(f"   Repo:       {task['repo']}")
+    print(f"   Mode:       {scan_mode} ({config['description']})")
+    print(f"   Command:    {' '.join(cmd)}")
+    print(f"   Target:     {repo_path}")
+    print(f"   Effort:     {config['reasoning_effort']}")
+    print(f"   Timeout:    {config['timeout_seconds'] // 60} min")
+    print(f"   LLM:        {llm_model}")
+    print(f"   Tier:       "
+          f"{'A (LLM-enriched)' if task.get('has_llm_enrichment') else 'B/C (deterministic)'}")
     print("")
 
     try:
         result = subprocess.run(
             cmd, env=env,
             capture_output=False,
-            timeout=14400,
+            timeout=config["timeout_seconds"],
         )
         return result.returncode
     except subprocess.TimeoutExpired:
-        print("  ⚠️  Strix scan timed out (4 hour limit)")
+        timeout_hours = config["timeout_seconds"] / 3600
+        print(f"  ⚠️  Strix scan timed out ({timeout_hours:.1f} hour limit "
+              f"for mode '{scan_mode}')")
         return -1
     except FileNotFoundError:
-        print("  ❌ Strix CLI not found. Install: curl -sSL https://strix.ai/install | bash")
+        print("  ❌ Strix CLI not found. Install: "
+              "curl -sSL https://strix.ai/install | bash")
         return -2
-
 
 def find_strix_run_dir(task: Dict) -> Optional[Path]:
     """Find the most recent Strix output directory matching this repo."""
@@ -1373,23 +1694,60 @@ def _read_strix_pentest_report(run_dir: Optional[Path]) -> Optional[str]:
  
 # ── Report assembly ──────────────────────────────────────────────
  
+
 def _build_pitboss_mapping_section(task: Dict, findings: List[Dict]) -> str:
-    """Prepend block that maps Strix findings to pit-boss risk context."""
+    """Prepend block that maps Strix findings to pit-boss risk context.
+
+    Surfaces the scope tier, pit-boss-flagged issues, and the actual Strix
+    findings so reviewers can immediately see correlation/divergence between
+    what pit-boss expected and what Strix found.
+    """
     lines = []
     lines.append(f"# Shakedown Report: {task['repo']}")
     lines.append("")
-    lines.append("## Pit-Boss Mapping")
+
+    # ── Scope context ───────────────────────────────────────
+    lines.append("## Scan Configuration")
     lines.append("")
     lines.append(f"- **Repo:** `{task['repo']}`")
-    lines.append(f"- **Source snapshot:** `{task.get('source_name', 'N/A')}`")
-    lines.append(f"- **Max NEW risk:** {task['max_risk']}/10")
-    lines.append(f"- **Max EXISTING risk:** {task['max_existing_risk']}/10")
-    lines.append(f"- **Critical issues flagged by pit-boss:** {task['critical_count']}")
-    lines.append(f"- **Override count:** {task['override_count']}")
-    lines.append(f"- **Scan duration:** {task.get('duration_seconds', 0) // 60} min")
-    lines.append(f"- **Strix exit code:** {task.get('strix_exit_code')}")
-    lines.append(f"- **LLM used:** {task.get('llm_used', 'N/A')}")
+    lines.append(f"- **Source snapshot(s):** "
+                 f"{', '.join(task.get('source_names', [task.get('source_name', 'N/A')]))}")
+    lines.append(f"- **Scan mode used:** "
+                 f"{task.get('suggested_scan_mode', 'default')}")
+    lines.append(f"- **Scope tier:** "
+                 f"{'A (LLM-enriched targeting)' if task.get('has_llm_enrichment') else 'B/C (deterministic)'}")
+    if task.get("priority_score"):
+        lines.append(f"- **Pit-boss priority score:** {task['priority_score']}")
     lines.append("")
+
+    # ── Pit-boss risk picture ───────────────────────────────
+    lines.append("## Pit-Boss Risk Picture")
+    lines.append("")
+    lines.append(f"- Max NEW risk: {task['max_risk']}/10")
+    lines.append(f"- Max EXISTING risk: {task['max_existing_risk']}/10")
+    lines.append(f"- Critical issues flagged by pit-boss: "
+                 f"{task['critical_count']}")
+    lines.append(f"- Override count: {task['override_count']}")
+    lines.append("")
+
+    # ── Why pit-boss flagged this repo ──────────────────────
+    reasons = task.get("reasons", [])
+    if reasons:
+        lines.append("**Pit-boss flagged this repo because:**")
+        for r in reasons:
+            lines.append(f"- {r}")
+        lines.append("")
+
+    # ── Scan execution ──────────────────────────────────────
+    lines.append("## Scan Execution")
+    lines.append("")
+    lines.append(f"- Duration: "
+                 f"{task.get('duration_seconds', 0) // 60} min")
+    lines.append(f"- Strix exit code: {task.get('strix_exit_code')}")
+    lines.append(f"- LLM used: {task.get('llm_used', 'N/A')}")
+    lines.append("")
+
+    # ── Strix findings summary ──────────────────────────────
     lines.append("## Strix Findings Summary")
     lines.append("")
     if findings:
@@ -1399,15 +1757,18 @@ def _build_pitboss_mapping_section(task: Dict, findings: List[Dict]) -> str:
         lines.append("|----|----------|-------|")
         for f in findings:
             title = f.get("title", "").replace("|", "\\|")
-            lines.append(f"| {f.get('id', '?')} | {f.get('severity', '?')} | {title} |")
+            lines.append(f"| {f.get('id', '?')} "
+                         f"| {f.get('severity', '?')} "
+                         f"| {title} |")
         lines.append("")
     else:
-        lines.append("Strix produced no structured findings (no `vulnerabilities.csv`).")
+        lines.append("Strix produced no structured findings "
+                     "(no `vulnerabilities.csv`).")
         lines.append("")
+
     lines.append("---")
     lines.append("")
     return "\n".join(lines)
- 
  
 def _assemble_report(task: Dict, run_dir: Optional[Path]) -> tuple[str, List[Dict]]:
     """Build the full report markdown.
