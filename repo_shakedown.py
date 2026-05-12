@@ -124,6 +124,8 @@ JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "")
 JIRA_PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "SEC")
 JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+JIRA_EPIC_KEY = os.environ.get("JIRA_EPIC_KEY", "")
+
 
 SCANNED_REPOS_LOCAL = WORK_DIR / "scanned_repos.json"
 _scanned_repos_cache: Optional[Dict[str, List[str]]] = None
@@ -1791,6 +1793,43 @@ def _parse_strix_findings(run_dir: Optional[Path]) -> List[Dict[str, str]]:
         return []
 
 
+def _load_finding_detail(run_dir: Optional[Path], finding_id: str) -> Optional[str]:
+    """Load the per-finding markdown file produced by Strix.
+
+    Strix writes one markdown per finding at:
+        <run_dir>/vulnerabilities/vuln-<id>.md
+
+    Returns the file contents as a string, or None if missing/unreadable.
+    Used as the body of per-finding Jira tickets.
+    """
+    if not run_dir or not run_dir.exists() or not finding_id:
+        return None
+
+    # finding_id from vulnerabilities.csv is typically the bare number ('0001')
+    # or already prefixed ('vuln-0001'). Handle both.
+    if finding_id.startswith("vuln-"):
+        filename = f"{finding_id}.md"
+    else:
+        filename = f"vuln-{finding_id}.md"
+
+    md_path = run_dir / "vulnerabilities" / filename
+    if not md_path.exists():
+        # Some Strix versions might use a different name convention
+        # — try variations
+        for alt in (run_dir / "vulnerabilities" / f"{finding_id}.md",
+                    run_dir / f"vuln-{finding_id}.md"):
+            if alt.exists():
+                md_path = alt
+                break
+        else:
+            return None
+
+    try:
+        return md_path.read_text()
+    except Exception as e:
+        print(f"  ⚠️  Could not read {md_path}: {e}")
+        return None
+
 def _read_strix_pentest_report(run_dir: Optional[Path]) -> Optional[str]:
     """Return the contents of Strix's penetration_test_report.md, or None."""
     if not run_dir or not run_dir.exists():
@@ -2147,60 +2186,220 @@ def _send_slack_notification(
         print(f"     {links_block}")
 
 
-def _create_jira_ticket(task: Dict, report_text: str, findings: List[Dict]):
-    """Create a Jira ticket using the assembled report as the body."""
+# Severity levels that warrant a Jira ticket. Anything else (LOW,
+# INFORMATIONAL, unknown) is silently skipped.
+_JIRA_TICKET_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM"}
+
+
+def _truncate_summary(text: str, max_len: int = 240) -> str:
+    """Trim text so the final Jira summary fits within Jira's 255-char limit.
+    Leaves headroom for prefix wrapping."""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def _create_jira_tickets_per_finding(
+    task: Dict,
+    findings: List[Dict],
+    run_dir: Optional[Path],
+    s3_urls: Optional[Dict[str, str]],
+):
+    """Create one Jira ticket per CRITICAL/HIGH/MEDIUM finding.
+
+    Title format: [SEVERITY] - repo_name - finding_title
+    Body: the per-finding markdown that Strix wrote to
+          <run_dir>/vulnerabilities/vuln-<id>.md
+    Plus: an S3 backlink to the full Strix output zip when available.
+
+    Silently does nothing when Jira env vars aren't set (the existing control
+    flag, governed by the GHA's enable_jira input which empties the secrets
+    when false).
+    """
+    # Gate: same control flag as the old per-scan implementation.
+    # The GHA's enable_jira=false sets these to empty strings, so unconfigured
+    # = no-op, exactly like before.
     if not all([JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN]):
         if findings:
-            print("\n  🎫 Jira not configured — would have filed:")
-            print(f"     Title: [Shakedown] {task['repo']} — "
-                  f"{len(findings)} finding(s)")
+            actionable = [f for f in findings
+                          if (f.get("severity") or "").upper()
+                          in _JIRA_TICKET_SEVERITIES]
+            if actionable:
+                print(f"\n  🎫 Jira not configured — would have filed "
+                      f"{len(actionable)} ticket(s)")
         return
- 
-    try:
-        import urllib.request
-        import base64
- 
-        priority = "High" if findings else "Medium"
-        label = "security-vuln-found" if findings else "security-review"
- 
-        payload = {
-            "fields": {
-                "project": {"key": JIRA_PROJECT_KEY},
-                "summary": (f"[Shakedown] {task['repo']} — "
-                            f"{len(findings)} finding(s), risk "
-                            f"{task['max_risk']}/{task['max_existing_risk']}"),
-                "description": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [{
-                        "type": "paragraph",
-                        "content": [{"type": "text",
-                                     "text": report_text[:30000]}],
-                    }],
-                },
-                "issuetype": {"name": "Task"},
-                "priority": {"name": priority},
-                "labels": [label, "repo-shakedown", "automated"],
-            }
-        }
-        auth = base64.b64encode(
-            f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()
-        ).decode()
-        url = f"{JIRA_BASE_URL.rstrip('/')}/rest/api/3/issue"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Basic {auth}",
-            },
-        )
-        resp = urllib.request.urlopen(req, timeout=15)
-        result = json.loads(resp.read())
-        print(f"  🎫 Jira ticket created: {result.get('key', '?')}")
-    except Exception as e:
-        print(f"  ⚠️  Jira ticket creation failed: {e}")
 
+    if not findings:
+        print("\n  🎫 No findings — no Jira tickets to create")
+        return
+
+    try:
+        from jira import JIRA, JIRAError
+    except ImportError:
+        print("  ⚠️  jira library not installed (pip install jira) — "
+              "skipping Jira integration")
+        return
+
+    # Connect once, reuse for all tickets in this scan
+    try:
+        client = JIRA(
+            server=JIRA_BASE_URL.rstrip("/"),
+            basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+            max_retries=2,
+        )
+    except Exception as e:
+        print(f"  ⚠️  Jira connection failed: {e}")
+        return
+
+    # Repo name without org prefix, for the title
+    repo_short = task["repo"].split("/")[-1] if "/" in task["repo"] else task["repo"]
+
+    # Filter to severities we ticket on
+    actionable_findings = [
+        f for f in findings
+        if (f.get("severity") or "").upper() in _JIRA_TICKET_SEVERITIES
+    ]
+    skipped_low = len(findings) - len(actionable_findings)
+
+    if not actionable_findings:
+        print(f"\n  🎫 No actionable findings "
+              f"(skipped {skipped_low} LOW/info finding(s))")
+        return
+
+    print(f"\n  🎫 Creating Jira tickets for "
+          f"{len(actionable_findings)} finding(s) "
+          f"(skipped {skipped_low} LOW/info)")
+
+    created = []
+    failed = 0
+
+    for finding in actionable_findings:
+        finding_id = finding.get("id", "")
+        severity = (finding.get("severity") or "UNKNOWN").upper()
+        finding_title = finding.get("title", "(untitled finding)")
+
+        # Title: [SEVERITY] - repo_short - finding_title
+        summary_body = f"[{severity}] - {repo_short} - {finding_title}"
+        summary = _truncate_summary(summary_body)
+
+        # Body: per-finding markdown if available, else CSV-derived fallback
+        detail_md = _load_finding_detail(run_dir, finding_id)
+        if detail_md:
+            description_parts = [detail_md]
+        else:
+            description_parts = [
+                f"# {finding_title}\n",
+                f"**ID:** {finding_id}",
+                f"**Severity:** {severity}",
+                f"**Repo:** {task['repo']}",
+                "",
+                "_Strix did not produce a per-finding markdown for this "
+                "vulnerability. See `vulnerabilities.csv` in the Strix run "
+                "output for the raw record._",
+            ]
+
+        # S3 backlink for full Strix output
+        if s3_urls and s3_urls.get("zip_url"):
+            description_parts.append("\n---\n")
+            description_parts.append(
+                f"**Full Strix output:** {s3_urls['zip_url']}"
+            )
+        if s3_urls and s3_urls.get("report_url"):
+            description_parts.append(
+                f"**Assembled report:** {s3_urls['report_url']}"
+            )
+
+        # Truncate body to stay under Jira's description limit (~32k)
+        description = "\n".join(description_parts)
+        if len(description) > 30000:
+            description = description[:30000] + "\n\n_[truncated]_"
+
+        priority_name = {
+            "CRITICAL": "Highest",
+            "HIGH": "High",
+            "MEDIUM": "Medium",
+        }.get(severity, "Medium")
+
+        fields = {
+            "project": {"key": JIRA_PROJECT_KEY},
+            "summary": summary,
+            "description": description,
+            "issuetype": {"name": "Task"},
+            "priority": {"name": priority_name},
+            "labels": [
+                "repo-shakedown",
+                "security-vuln-found",
+                "automated",
+                f"severity-{severity.lower()}",
+                # Sanitize the repo label — Jira labels can't contain '/'
+                f"repo-{task['repo'].replace('/', '-')}",
+            ],
+        }
+
+        if JIRA_EPIC_KEY:
+            fields["parent"] = {"key": JIRA_EPIC_KEY}
+
+        # Try with everything; fall back without priority if that's rejected;
+        # finally without parent if that's rejected too.
+        attempts = [
+            ("full", fields),
+        ]
+        f_no_priority = dict(fields)
+        f_no_priority.pop("priority", None)
+        attempts.append(("without priority", f_no_priority))
+        if "parent" in f_no_priority:
+            f_no_parent = dict(f_no_priority)
+            f_no_parent.pop("parent", None)
+            attempts.append(("without priority and without parent", f_no_parent))
+
+        ticket_created = False
+        for label, attempt_fields in attempts:
+            try:
+                issue = client.create_issue(fields=attempt_fields)
+                key = issue.key
+                created.append({
+                    "key": key,
+                    "severity": severity,
+                    "title": finding_title,
+                    "fallback": label,
+                })
+                fallback_note = f" ({label})" if label != "full" else ""
+                print(f"     ✓ {key} [{severity}] {finding_title}{fallback_note}")
+                ticket_created = True
+                break
+            except JIRAError as e:
+                # Only retry on field-shape errors. Auth/permission errors
+                # won't get better by removing fields, so bail out.
+                err_text = str(e.text).lower() if hasattr(e, "text") else str(e).lower()
+                if e.status_code in (400, 422) and (
+                    "field" in err_text
+                    or "parent" in err_text
+                    or "priority" in err_text
+                ):
+                    continue
+                else:
+                    print(f"     ❌ [{severity}] {finding_title}: "
+                          f"{e.status_code} {err_text}")
+                    failed += 1
+                    ticket_created = True  # don't try more attempts
+                    break
+            except Exception as e:
+                print(f"     ❌ [{severity}] {finding_title}: {e}")
+                failed += 1
+                ticket_created = True
+                break
+
+        if not ticket_created:
+            print(f"     ❌ [{severity}] {finding_title}: all attempts exhausted")
+            failed += 1
+
+    # Summary
+    if created and failed:
+        print(f"  🎫 Jira: created {len(created)}, failed {failed}")
+    elif created:
+        print(f"  🎫 Jira: created {len(created)} ticket(s)")
+    elif failed:
+        print(f"  🎫 Jira: all {failed} ticket(s) failed")
 
 def _report_single_task(
     task: Dict,
@@ -2243,7 +2442,7 @@ def _report_single_task(
  
     # Notify
     _send_slack_notification(task, findings, s3_urls)
-    _create_jira_ticket(task, report_text, findings)
+    _create_jira_tickets_per_finding(task, findings, run_dir, s3_urls)
  
     # Monthly dedup
     _mark_repo_scanned_this_month(task["repo"])

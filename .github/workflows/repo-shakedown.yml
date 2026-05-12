@@ -64,6 +64,11 @@ on:
         required: false
         type: string
         default: 'SEC'
+      jira_epic_key:
+        description: 'Optional epic key to parent all created tickets (e.g. SEC-123)'
+        required: false
+        type: string
+        default: ''
       shakedown_threshold:
         description: 'Min max_risk score for a repo to be selected for scanning (default: 5)'
         required: false
@@ -218,6 +223,7 @@ jobs:
           SLACK_WEBHOOK_URL:     ${{ inputs.enable_slack && secrets.SLACK_WEBHOOK_URL || '' }}
           JIRA_BASE_URL:         ${{ inputs.enable_jira && secrets.JIRA_BASE_URL || '' }}
           JIRA_PROJECT_KEY:      ${{ inputs.jira_project_key }}
+          JIRA_EPIC_KEY:         ${{ inputs.enable_jira && inputs.jira_epic_key || '' }}
           JIRA_EMAIL:            ${{ inputs.enable_jira && secrets.JIRA_EMAIL || '' }}
           JIRA_API_TOKEN:        ${{ inputs.enable_jira && secrets.JIRA_API_TOKEN || '' }}
         run: |
