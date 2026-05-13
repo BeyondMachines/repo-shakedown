@@ -1486,7 +1486,7 @@ def cmd_precheck(args):
     if output_file:
         with open(output_file, "a") as f:
             f.write(f"has_work={'true' if has_work else 'false'}\n")
-            f.write(f"candidate_count={candidate_count}\n")
+            f.write(f"candidate_count={len(eligible)}\n")
 
     return 0
 
