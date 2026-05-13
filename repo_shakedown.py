@@ -1411,35 +1411,76 @@ def cmd_precheck(args):
     merged = build_merged_repo_index(pitboss_files)
     print(f"\n   Merged index: {len(merged)} unique repos across all sources")
 
+
     has_work = False
-    candidate_count = 0
-    skipped_monthly = 0
+    eligible = []         # passes threshold, not yet scanned this month
+    already_scanned = []  # passes threshold, but in scanned_repos.json
+    below_threshold = []  # in merged index but doesn't pass threshold
 
     for repo, data in merged.items():
         max_risk = data.get("max_risk", 0)
         max_existing = data.get("max_existing_risk", 0)
         priority = data.get("priority_score", 0)
-
-        # Same qualification as extract_tasks_from_merged
         effective_risk = max(max_risk, max_existing)
-        if effective_risk < args.threshold and priority <= 0:
+        llm_marker = " [LLM-enriched]" if data.get("llm_scan_instructions") else ""
+        priority_marker = f" priority={priority}" if priority > 0 else ""
+
+        # Bucket the repo
+        passes_threshold = (effective_risk >= args.threshold) or (priority > 0)
+
+        if not passes_threshold:
+            below_threshold.append((repo, max_risk, max_existing, priority,
+                                    priority_marker, llm_marker))
             continue
 
         if _is_repo_scanned_this_month(repo):
-            skipped_monthly += 1
+            already_scanned.append((repo, max_risk, max_existing, priority,
+                                    priority_marker, llm_marker))
             continue
 
+        eligible.append((repo, max_risk, max_existing, priority,
+                         priority_marker, llm_marker))
         has_work = True
-        candidate_count += 1
-        priority_marker = f" priority={priority}" if priority > 0 else ""
-        llm_marker = " [LLM-enriched]" if data.get("llm_scan_instructions") else ""
-        print(f"  ✅ {repo} (new={max_risk}, "
-              f"existing={max_existing}{priority_marker}{llm_marker})")
 
+    # Sort each bucket by effective risk descending so highest-signal repos
+    # appear first within their group
+    def _sort_key(entry):
+        _, max_r, max_e, _, _, _ = entry
+        return max(max_r, max_e)
+
+    eligible.sort(key=_sort_key, reverse=True)
+    already_scanned.sort(key=_sort_key, reverse=True)
+    below_threshold.sort(key=_sort_key, reverse=True)
+
+    # ── Print the three buckets ──────────────────────────────
+    if eligible:
+        print(f"\n✅ Eligible to scan now ({len(eligible)} repo(s)):")
+        for repo, max_r, max_e, _, prio_mk, llm_mk in eligible:
+            print(f"   ✅ {repo} (new={max_r}, existing={max_e}{prio_mk}{llm_mk})")
+    else:
+        print(f"\n✅ Eligible to scan now: none")
+
+    if already_scanned:
+        print(f"\n☑️  Already scanned this month "
+              f"({len(already_scanned)} repo(s), in scanned_repos.json):")
+        for repo, max_r, max_e, _, prio_mk, llm_mk in already_scanned:
+            print(f"   ☑️  {repo} (new={max_r}, existing={max_e}{prio_mk}{llm_mk})")
+
+    if below_threshold:
+        print(f"\n⏬ Below threshold {args.threshold} "
+              f"({len(below_threshold)} repo(s) — pit-boss saw activity but "
+              f"effective_risk < threshold):")
+        for repo, max_r, max_e, _, prio_mk, llm_mk in below_threshold:
+            print(f"   ⏬ {repo} (new={max_r}, existing={max_e}{prio_mk}{llm_mk})")
+
+    # ── Summary ─────────────────────────────────────────────
     print(f"\n📋 Precheck summary:")
-    print(f"   Qualifying repos:   {candidate_count}")
-    print(f"   Skipped (monthly):  {skipped_monthly}")
-    print(f"   Has work:           {has_work}")
+    print(f"   Total repos in merged index:  {len(merged)}")
+    print(f"   Eligible to scan now:         {len(eligible)}")
+    print(f"   Already scanned this month:   {len(already_scanned)}")
+    print(f"   Below threshold {args.threshold}:           "
+          f"{len(below_threshold)}")
+    print(f"   Has work:                     {has_work}")
 
     output_file = os.environ.get("GITHUB_OUTPUT")
     if output_file:
